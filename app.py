@@ -65,6 +65,140 @@ def _safe_divide(numerator: pd.Series | float, denominator: pd.Series | float) -
     return pd.NA
 
 
+def add_95_confidence_bounds(
+    fig: go.Figure,
+    df: pd.DataFrame,
+    x_col: str,
+    y_cols: str | list[str],
+    rolling_window: int = 14,
+    show_ci: bool = True,
+    show_anomalies: bool = True,
+    interval_mode: str = "context",
+    metric_color_map: dict[str, str] | None = None,
+    ci_alpha: float = 0.14,
+) -> go.Figure:
+    if isinstance(y_cols, str):
+        y_cols = [y_cols]
+
+    theme_line_colors = ["#00D1FF", "#2E6BFF", "#FF4D6D", "#00C49A", "#A66CFF"]
+
+    def color_with_alpha(color_value: str | None, alpha: float = 0.14) -> str:
+        if not color_value:
+            return f"rgba(99, 110, 250, {alpha})"
+
+        color_value = str(color_value).strip()
+
+        if color_value.startswith("rgba("):
+            channels = color_value[5:-1].split(",")
+            if len(channels) >= 3:
+                r, g, b = [c.strip() for c in channels[:3]]
+                return f"rgba({r}, {g}, {b}, {alpha})"
+
+        if color_value.startswith("rgb("):
+            channels = color_value[4:-1].split(",")
+            if len(channels) >= 3:
+                r, g, b = [c.strip() for c in channels[:3]]
+                return f"rgba({r}, {g}, {b}, {alpha})"
+
+        if color_value.startswith("#"):
+            hex_color = color_value.lstrip("#")
+            if len(hex_color) == 3:
+                hex_color = "".join(ch * 2 for ch in hex_color)
+            if len(hex_color) == 6:
+                r = int(hex_color[0:2], 16)
+                g = int(hex_color[2:4], 16)
+                b = int(hex_color[4:6], 16)
+                return f"rgba({r}, {g}, {b}, {alpha})"
+
+        return f"rgba(99, 110, 250, {alpha})"
+
+    metric_line_colors: dict[str, str | None] = {}
+    if metric_color_map:
+        for metric_name, metric_color in metric_color_map.items():
+            metric_line_colors[metric_name] = metric_color
+
+    for trace in fig.data:
+        trace_name = getattr(trace, "name", None)
+        if trace_name and trace_name not in metric_line_colors:
+            trace_line = getattr(trace, "line", None)
+            metric_line_colors[trace_name] = getattr(trace_line, "color", None)
+
+    if x_col not in df.columns:
+        return fig
+
+    x_values = df[x_col]
+    min_periods = 5 if rolling_window >= 10 else max(3, rolling_window // 2)
+
+    for index, metric in enumerate(y_cols):
+        if metric not in df.columns:
+            continue
+
+        if not metric_line_colors.get(metric):
+            metric_line_colors[metric] = theme_line_colors[index % len(theme_line_colors)]
+            for trace in fig.data:
+                if getattr(trace, "name", None) == metric:
+                    if getattr(trace, "line", None) is not None:
+                        trace.line.color = metric_line_colors[metric]
+                    else:
+                        trace.line = dict(color=metric_line_colors[metric])
+
+        series = pd.to_numeric(df[metric], errors="coerce")
+        if series.notna().sum() < min_periods:
+            continue
+
+        rolling_mean = series.rolling(rolling_window, min_periods=min_periods).mean()
+        rolling_std = series.rolling(rolling_window, min_periods=min_periods).std(ddof=0)
+        if interval_mode == "predictive":
+            rolling_mean = rolling_mean.shift(1)
+            rolling_std = rolling_std.shift(1)
+
+        z_score = 1.96
+        upper_bound = rolling_mean + z_score * rolling_std
+        lower_bound = rolling_mean - z_score * rolling_std
+
+        color = color_with_alpha(metric_line_colors.get(metric), alpha=ci_alpha)
+
+        if show_ci:
+            fig.add_trace(
+                go.Scatter(
+                    x=x_values,
+                    y=upper_bound,
+                    mode="lines",
+                    line=dict(width=0),
+                    hoverinfo="skip",
+                    showlegend=False,
+                    name=f"{metric} 95% Upper",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=x_values,
+                    y=lower_bound,
+                    mode="lines",
+                    line=dict(width=0),
+                    fill="tonexty",
+                    fillcolor=color,
+                    hoverinfo="skip",
+                    showlegend=False,
+                    name=f"{metric} 95% CI",
+                )
+            )
+
+        anomaly_mask = (series > upper_bound) | (series < lower_bound)
+        if show_anomalies and anomaly_mask.fillna(False).any():
+            fig.add_trace(
+                go.Scatter(
+                    x=x_values[anomaly_mask],
+                    y=series[anomaly_mask],
+                    mode="markers",
+                    marker=dict(color="red", size=9, symbol="x"),
+                    name=f"{metric} anomaly",
+                )
+            )
+
+    return fig
+
+
 def make_daily_summary(filtered_df: pd.DataFrame) -> pd.DataFrame:
     daily = (
         filtered_df.groupby("Reporting starts", as_index=False)
@@ -278,6 +412,20 @@ def make_attribution_ad_summary(filtered_df: pd.DataFrame):
     return ad_agg
 
 
+def apply_metric_colors(fig: go.Figure, metric_color_map: dict[str, str]) -> go.Figure:
+    for trace in fig.data:
+        trace_name = getattr(trace, "name", None)
+        if trace_name in metric_color_map:
+            trace_color = metric_color_map[trace_name]
+            if getattr(trace, "line", None) is not None:
+                trace.line.color = trace_color
+            else:
+                trace.line = dict(color=trace_color)
+            if getattr(trace, "marker", None) is not None:
+                trace.marker.color = trace_color
+    return fig
+
+
 def make_kpi_row(filtered_df: pd.DataFrame, daily: pd.DataFrame) -> None:
     total_spend = filtered_df["Amount spent (USD)"].sum(skipna=True)
     total_results = filtered_df["Results"].sum(skipna=True)
@@ -347,6 +495,37 @@ def main() -> None:
             options=ad_options,
             default=ad_options,
         )
+
+        st.divider()
+        st.subheader("Anomaly Overlays")
+        show_ci_bands = st.checkbox("Show 95% confidence bands", value=True)
+        show_anomaly_markers = st.checkbox("Show anomaly markers", value=True)
+        ci_mode_label = st.radio(
+            "Band mode",
+            options=["Context bands", "1-step predictive bands"],
+            horizontal=False,
+        )
+        interval_mode = "predictive" if ci_mode_label == "1-step predictive bands" else "context"
+        overlay_channels = [
+            "Cost per Result Trend",
+            "CTR vs CVR Trend",
+            "Normalized Output per $100",
+            "Adset Rolling Frequency",
+            "Frequency Trend (Fatigue)",
+            "Fatigue Index (30D)",
+            "Attribution Frequency Trend",
+            "Overall CPM Trend",
+        ]
+        selected_overlay_channels = st.multiselect(
+            "Charts with overlays",
+            options=overlay_channels,
+            default=overlay_channels,
+        )
+
+    selected_overlay_channels_set = set(selected_overlay_channels)
+
+    def overlay_enabled(channel_name: str) -> bool:
+        return channel_name in selected_overlay_channels_set and (show_ci_bands or show_anomaly_markers)
 
     filtered_df = df.copy()
 
@@ -424,11 +603,25 @@ def main() -> None:
                 markers=True,
                 title="Cost per Result Trend",
             )
+            if overlay_enabled("Cost per Result Trend"):
+                cpr_fig = add_95_confidence_bounds(
+                    cpr_fig,
+                    daily,
+                    "Reporting starts",
+                    "Cost per Result",
+                    show_ci=show_ci_bands,
+                    show_anomalies=show_anomaly_markers,
+                    interval_mode=interval_mode,
+                )
             st.plotly_chart(cpr_fig, width="stretch")
 
         row_2_col_1, row_2_col_2 = st.columns(2)
 
         with row_2_col_1:
+            ctr_cvr_colors = {
+                "CTR %": "#00D1FF",
+                "CVR % (Result/Click)": "#FF4D6D",
+            }
             ctr_cvr_fig = px.line(
                 daily,
                 x="Reporting starts",
@@ -436,9 +629,26 @@ def main() -> None:
                 markers=True,
                 title="CTR vs CVR Trend",
             )
+            ctr_cvr_fig = apply_metric_colors(ctr_cvr_fig, ctr_cvr_colors)
+            if overlay_enabled("CTR vs CVR Trend"):
+                ctr_cvr_fig = add_95_confidence_bounds(
+                    ctr_cvr_fig,
+                    daily,
+                    "Reporting starts",
+                    ["CTR %", "CVR % (Result/Click)"],
+                    show_ci=show_ci_bands,
+                    show_anomalies=show_anomaly_markers,
+                    interval_mode=interval_mode,
+                    metric_color_map=ctr_cvr_colors,
+                )
             st.plotly_chart(ctr_cvr_fig, width="stretch")
 
         with row_2_col_2:
+            per_100_colors = {
+                "Results per $100": "#2E6BFF",
+                "Clicks per $100": "#00D1FF",
+                "LPV per $100": "#FF4D6D",
+            }
             per_100_fig = px.line(
                 daily,
                 x="Reporting starts",
@@ -446,6 +656,18 @@ def main() -> None:
                 markers=True,
                 title="Normalized Output per $100",
             )
+            per_100_fig = apply_metric_colors(per_100_fig, per_100_colors)
+            if overlay_enabled("Normalized Output per $100"):
+                per_100_fig = add_95_confidence_bounds(
+                    per_100_fig,
+                    daily,
+                    "Reporting starts",
+                    ["Results per $100", "Clicks per $100", "LPV per $100"],
+                    show_ci=show_ci_bands,
+                    show_anomalies=show_anomaly_markers,
+                    interval_mode=interval_mode,
+                    metric_color_map=per_100_colors,
+                )
             st.plotly_chart(per_100_fig, width="stretch")
 
     with tabs[1]:
@@ -616,6 +838,23 @@ def main() -> None:
             markers=True,
             title=f"Rolling Frequency - {selected_adset}",
         )
+        adset_freq_colors = {
+            "Daily Frequency": "#00D1FF",
+            "Weekly Rolling Frequency (7D)": "#2E6BFF",
+            "Monthly Rolling Frequency (30D)": "#FF4D6D",
+        }
+        adset_freq_fig = apply_metric_colors(adset_freq_fig, adset_freq_colors)
+        if overlay_enabled("Adset Rolling Frequency"):
+            adset_freq_fig = add_95_confidence_bounds(
+                adset_freq_fig,
+                selected_adset_df,
+                "Reporting starts",
+                ["Daily Frequency", "Weekly Rolling Frequency (7D)", "Monthly Rolling Frequency (30D)"],
+                show_ci=show_ci_bands,
+                show_anomalies=show_anomaly_markers,
+                interval_mode=interval_mode,
+                metric_color_map=adset_freq_colors,
+            )
         st.plotly_chart(adset_freq_fig, width="stretch")
 
         st.dataframe(
@@ -748,6 +987,11 @@ def main() -> None:
         trend_col1, trend_col2 = st.columns(2)
 
         with trend_col1:
+            fatigue_freq_colors = {
+                "Daily Frequency": "#00D1FF",
+                "Weekly Rolling Frequency (7D)": "#2E6BFF",
+                "Monthly Rolling Frequency (30D)": "#FF4D6D",
+            }
             fatigue_trend = px.line(
                 fatigue_roll,
                 x="Reporting starts",
@@ -755,6 +999,18 @@ def main() -> None:
                 markers=True,
                 title="Frequency Trend (Daily vs 7D vs 30D)",
             )
+            fatigue_trend = apply_metric_colors(fatigue_trend, fatigue_freq_colors)
+            if overlay_enabled("Frequency Trend (Fatigue)"):
+                fatigue_trend = add_95_confidence_bounds(
+                    fatigue_trend,
+                    fatigue_roll,
+                    "Reporting starts",
+                    ["Daily Frequency", "Weekly Rolling Frequency (7D)", "Monthly Rolling Frequency (30D)"],
+                    show_ci=show_ci_bands,
+                    show_anomalies=show_anomaly_markers,
+                    interval_mode=interval_mode,
+                    metric_color_map=fatigue_freq_colors,
+                )
             st.plotly_chart(fatigue_trend, width="stretch")
 
         with trend_col2:
@@ -773,6 +1029,16 @@ def main() -> None:
             markers=True,
             title="30D Fatigue Index Trend",
         )
+        if overlay_enabled("Fatigue Index (30D)"):
+            fatigue_index_fig = add_95_confidence_bounds(
+                fatigue_index_fig,
+                fatigue_roll,
+                "Reporting starts",
+                "Fatigue Index (30D)",
+                show_ci=show_ci_bands,
+                show_anomalies=show_anomaly_markers,
+                interval_mode=interval_mode,
+            )
         st.plotly_chart(fatigue_index_fig, width="stretch")
 
         split_totals = pd.DataFrame(
@@ -927,6 +1193,50 @@ def main() -> None:
                     line=dict(color="#2ca02c", width=3),
                 ))
 
+                freq_series = pd.to_numeric(attr_health_daily_sorted["Frequency"], errors="coerce")
+                if overlay_enabled("Attribution Frequency Trend") and freq_series.notna().sum() >= 5:
+                    freq_roll_mean = freq_series.rolling(14, min_periods=5).mean()
+                    freq_roll_std = freq_series.rolling(14, min_periods=5).std(ddof=0)
+                    if interval_mode == "predictive":
+                        freq_roll_mean = freq_roll_mean.shift(1)
+                        freq_roll_std = freq_roll_std.shift(1)
+                    freq_upper = freq_roll_mean + 1.96 * freq_roll_std
+                    freq_lower = freq_roll_mean - 1.96 * freq_roll_std
+                    if show_ci_bands:
+                        fig_attr.add_trace(go.Scatter(
+                            x=attr_health_daily_sorted["Reporting starts"],
+                            y=freq_upper,
+                            yaxis="y2",
+                            mode="lines",
+                            line=dict(width=0),
+                            hoverinfo="skip",
+                            showlegend=False,
+                            name="Frequency 95% Upper",
+                        ))
+                        fig_attr.add_trace(go.Scatter(
+                            x=attr_health_daily_sorted["Reporting starts"],
+                            y=freq_lower,
+                            yaxis="y2",
+                            mode="lines",
+                            line=dict(width=0),
+                            fill="tonexty",
+                            fillcolor="rgba(44, 160, 44, 0.14)",
+                            hoverinfo="skip",
+                            showlegend=False,
+                            name="Frequency 95% CI",
+                        ))
+
+                    freq_anomaly = (freq_series > freq_upper) | (freq_series < freq_lower)
+                    if show_anomaly_markers and freq_anomaly.fillna(False).any():
+                        fig_attr.add_trace(go.Scatter(
+                            x=attr_health_daily_sorted.loc[freq_anomaly, "Reporting starts"],
+                            y=freq_series[freq_anomaly],
+                            yaxis="y2",
+                            mode="markers",
+                            marker=dict(color="red", size=9, symbol="x"),
+                            name="Frequency anomaly",
+                        ))
+
                 fig_attr.update_layout(
                     title="Frequency vs Attribution Split (7D Click vs 1D View)",
                     barmode="stack",
@@ -1038,6 +1348,16 @@ def main() -> None:
             markers=True,
             title="Overall Daily CPM Trend",
         )
+        if overlay_enabled("Overall CPM Trend"):
+            cpm_overall_fig = add_95_confidence_bounds(
+                cpm_overall_fig,
+                cpm_daily,
+                "Reporting starts",
+                "CPM",
+                show_ci=show_ci_bands,
+                show_anomalies=show_anomaly_markers,
+                interval_mode=interval_mode,
+            )
         st.plotly_chart(cpm_overall_fig, width="stretch")
 
         cpm_by_ad = (
