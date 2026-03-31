@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import datetime
 import os
+import pickle
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -14,6 +16,46 @@ import streamlit as st
 from facebook_business.api import FacebookAdsApi
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.adobjects.adsinsights import AdsInsights
+
+CACHE_DIR = Path.home() / ".metaads_cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _cache_filename(account_id: str, date_start: str, date_stop: str) -> str:
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_id = account_id.replace("act_", "")
+    return f"{safe_id}_{date_start}_{date_stop}_{ts}.pkl"
+
+
+def _save_cache(
+    df: pd.DataFrame,
+    freq_data: dict,
+    account_id: str,
+    date_start: str,
+    date_stop: str,
+) -> Path:
+    payload = {
+        "df": df,
+        "freq_data": freq_data,
+        "account_id": account_id,
+        "date_start": date_start,
+        "date_stop": date_stop,
+        "saved_at": datetime.datetime.now().isoformat(),
+    }
+    path = CACHE_DIR / _cache_filename(account_id, date_start, date_stop)
+    with open(path, "wb") as fh:
+        pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    return path
+
+
+def _load_cache(path: Path) -> dict:
+    with open(path, "rb") as fh:
+        return pickle.load(fh)
+
+
+def _list_caches() -> list[Path]:
+    files = sorted(CACHE_DIR.glob("*.pkl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return files
 
 
 def fetch_from_api(
@@ -64,6 +106,7 @@ def fetch_from_api(
         "time_increment": 1,   # one row per day per ad
         "level": "ad",
         "limit": 500,
+        "action_attribution_windows": ["7d_click", "1d_view"],
     }
 
     try:
@@ -83,6 +126,16 @@ def fetch_from_api(
         for item in actions_list:
             if item.get("action_type") == action_type:
                 return float(item.get("value", 0))
+        return None
+
+    def _get_action_window(actions_list: list | None, action_type: str, window: str) -> float | None:
+        """Return the action count for a specific attribution window (e.g. '7d_click', '1d_view')."""
+        if not actions_list:
+            return None
+        for item in actions_list:
+            if item.get("action_type") == action_type:
+                val = item.get(window)
+                return float(val) if val is not None else None
         return None
 
     def _get_cost_per_action(cpa_list: list | None, action_type: str) -> float | None:
@@ -109,6 +162,8 @@ def fetch_from_api(
         link_clicks = _get_action(actions_list, "link_click")
         landing_page_views = _get_action(actions_list, "landing_page_view")
         purchases = _get_action(actions_list, "offsite_conversion.fb_pixel_purchase")
+        purchases_7d_click = _get_action_window(actions_list, "offsite_conversion.fb_pixel_purchase", "7d_click")
+        purchases_1d_view = _get_action_window(actions_list, "offsite_conversion.fb_pixel_purchase", "1d_view")
         video_3s = (float(video_plays[0]["value"]) if video_plays else None)
         thruplays = (float(video_thru[0]["value"]) if video_thru else None)
         cost_per_thruplay = _get_cost_per_action(
@@ -150,9 +205,11 @@ def fetch_from_api(
             "Video plays at 95%": float(video_p95[0]["value"]) if video_p95 else None,
             "Photo clicks": _get_action(actions_list, "photo_view"),
             "Purchases": purchases,
+            "Results (7d_click)": purchases_7d_click,
+            "Results (1d_view)": purchases_1d_view,
             "Purchase ROAS (return on ad spend)": roas_value,
-            "Results": link_clicks,          # default; adjust below per objective
-            "Cost per results": _get_cost_per_action(cpa_list, "link_click"),
+            "Results": purchases,
+            "Cost per results": _get_cost_per_action(cpa_list, "offsite_conversion.fb_pixel_purchase"),
             "Ad set budget": None,           # requires separate adset call; left blank
             "Viewers": float(d["reach"]) if d.get("reach") else None,
         }
@@ -192,7 +249,6 @@ def fetch_frequency_breakdowns(
         adset_cumulative   – cumulative adset-level reach/freq for each end-date
         ad_cumulative      – cumulative ad-level reach/freq for each end-date
     """
-    import datetime
     FacebookAdsApi.init(access_token=access_token)
     account_id = (
         ad_account_id if ad_account_id.startswith("act_") else f"act_{ad_account_id}"
@@ -635,34 +691,39 @@ def make_rolling_frequency_summary(
 
 
 def make_attribution_health_summary(filtered_df: pd.DataFrame, account_daily_df: pd.DataFrame | None = None):
-    """Create daily summary split by attribution type (7-day click vs 1-day view)."""
-    if "Attribution setting" not in filtered_df.columns:
-        return None, None
-    
-    attr_daily = (
-        filtered_df.groupby(["Reporting starts", "Attribution setting"], as_index=False)
-        .agg({
-            "Results": "sum",
-            "Amount spent (USD)": "sum",
-            "Impressions": "sum",
-            "Reach": "sum",
-            "Link clicks": "sum",
-        })
-        .sort_values(["Reporting starts", "Attribution setting"])
-    )
-    
-    attr_daily["CPM"] = _safe_divide(attr_daily["Amount spent (USD)"] * 1000, attr_daily["Impressions"])
-    attr_daily["CTR %"] = _safe_divide(attr_daily["Link clicks"], attr_daily["Impressions"]) * 100
-    attr_daily["Frequency"] = _safe_divide(attr_daily["Impressions"], attr_daily["Reach"])
-    attr_daily["ROAS"] = _safe_divide(attr_daily["Results"], attr_daily["Amount spent (USD)"])
-    
+    """Create daily summary. Attribution split is included only if Attribution setting column is present."""
+    has_attr = "Attribution setting" in filtered_df.columns
+
+    attr_daily = None
+    if has_attr:
+        attr_daily = (
+            filtered_df.groupby(["Reporting starts", "Attribution setting"], as_index=False)
+            .agg({
+                "Results": "sum",
+                "Amount spent (USD)": "sum",
+                "Impressions": "sum",
+                "Reach": "sum",
+                "Link clicks": "sum",
+            })
+            .sort_values(["Reporting starts", "Attribution setting"])
+        )
+        attr_daily["CPM"] = _safe_divide(attr_daily["Amount spent (USD)"] * 1000, attr_daily["Impressions"])
+        attr_daily["CTR %"] = _safe_divide(attr_daily["Link clicks"], attr_daily["Impressions"]) * 100
+        attr_daily["Frequency"] = _safe_divide(attr_daily["Impressions"], attr_daily["Reach"])
+        attr_daily["ROAS"] = _safe_divide(attr_daily["Results"], attr_daily["Amount spent (USD)"])
+
+    _agg_map = {
+        "Impressions": "sum",
+        "Reach": "sum",
+        "Results": "sum",
+        "Amount spent (USD)": "sum",
+    }
+    for _w_col in ["Results (7d_click)", "Results (1d_view)"]:
+        if _w_col in filtered_df.columns:
+            _agg_map[_w_col] = "sum"
     daily_agg = (
         filtered_df.groupby("Reporting starts", as_index=False)
-        .agg({
-            "Impressions": "sum",
-            "Reach": "sum",
-            "Amount spent (USD)": "sum",
-        })
+        .agg(_agg_map)
     )
     if account_daily_df is not None and not account_daily_df.empty:
         acct = account_daily_df[["date_start", "reach", "frequency"]].copy()
@@ -683,10 +744,7 @@ def make_attribution_health_summary(filtered_df: pd.DataFrame, account_daily_df:
 
 
 def make_attribution_ad_summary(filtered_df: pd.DataFrame, ad_alldays_df: pd.DataFrame | None = None):
-    """Create ad summary with attribution and scaling analysis."""
-    if "Attribution setting" not in filtered_df.columns:
-        return None
-    
+    """Create per-ad summary with frequency, ROAS, and scaling analysis."""
     ad_agg = (
         filtered_df.groupby(["Ad name", "Ad delivery"], as_index=False)
         .agg({
@@ -771,46 +829,102 @@ def main() -> None:
         st.error("FB_ACCESS_TOKEN and FB_ACCOUNT_ID must be set in ~/.metaads.env")
         st.stop()
 
-    # ── Sidebar: date range + fetch ───────────────────────────────────────────
+    # ── Sidebar: data source ─────────────────────────────────────────────────
     with st.sidebar:
-        st.header("Meta Ads API")
-        api_date_start = st.date_input("From", value=None, key="fb_date_start")
-        api_date_stop = st.date_input("To", value=None, key="fb_date_stop")
-        fetch_api = st.button("Fetch from API", key="fb_fetch")
+        st.header("Data Source")
+        data_source = st.radio("Load from", ["API", "Cache"], horizontal=True, key="data_source")
+
+        if data_source == "API":
+            st.subheader("Meta Ads API")
+            api_date_start = st.date_input("From", value=None, key="fb_date_start")
+            api_date_stop = st.date_input("To", value=None, key="fb_date_stop")
+            fetch_api = st.button("Fetch from API", key="fb_fetch")
+            load_cache_btn = False
+            selected_cache_path: Path | None = None
+        else:
+            cache_files = _list_caches()
+            if cache_files:
+                cache_labels = [f.name for f in cache_files]
+                selected_cache_label = st.selectbox(
+                    "Select cache file",
+                    options=cache_labels,
+                    key="cache_select",
+                )
+                selected_cache_path = CACHE_DIR / selected_cache_label
+                load_cache_btn = st.button("Load Cache", key="cache_load")
+            else:
+                st.info("No cache files found. Fetch from API first.")
+                selected_cache_path = None
+                load_cache_btn = False
+            fetch_api = False
+            api_date_start = None
+            api_date_stop = None
 
     # ── Data loading ──────────────────────────────────────────────────────────
-    if not (api_date_start and api_date_stop):
-        st.info("Pick a date range in the sidebar and click **Fetch from API**.")
-        st.stop()
-
-    if not fetch_api:
-        st.info("Click **Fetch from API** in the sidebar to load data.")
-        st.stop()
-
-    with st.spinner("Fetching data from Meta API…"):
-        df = fetch_from_api(
-            access_token=api_token,
-            ad_account_id=api_account_id,
+    if data_source == "Cache":
+        if not load_cache_btn:
+            st.info("Select a cache file and click **Load Cache**.")
+            st.stop()
+        if selected_cache_path is None or not selected_cache_path.exists():
+            st.error("Cache file not found.")
+            st.stop()
+        with st.spinner(f"Loading cache: {selected_cache_path.name}…"):
+            cached = _load_cache(selected_cache_path)
+        df = cached["df"]
+        # Patch caches saved before Results was corrected to purchases
+        if "Purchases" in df.columns:
+            df["Results"] = df["Purchases"]
+        # Patch caches saved before attribution window columns existed
+        if "Results (7d_click)" not in df.columns:
+            df["Results (7d_click)"] = None
+        if "Results (1d_view)" not in df.columns:
+            df["Results (1d_view)"] = None
+        freq_data = cached["freq_data"]
+        _src_label = (
+            f"Cache: {selected_cache_path.name}  |  "
+            f"{cached.get('date_start')} → {cached.get('date_stop')}  |  "
+            f"Account {cached.get('account_id')}"
+        )
+    else:
+        if not (api_date_start and api_date_stop):
+            st.info("Pick a date range in the sidebar and click **Fetch from API**.")
+            st.stop()
+        if not fetch_api:
+            st.info("Click **Fetch from API** in the sidebar to load data.")
+            st.stop()
+        with st.spinner("Fetching ad insights from Meta API…"):
+            df = fetch_from_api(
+                access_token=api_token,
+                ad_account_id=api_account_id,
+                date_start=api_date_start.strftime("%Y-%m-%d"),
+                date_stop=api_date_stop.strftime("%Y-%m-%d"),
+            )
+        if df.empty:
+            st.stop()
+        with st.spinner("Fetching reach & frequency breakdowns from Meta API…"):
+            freq_data = fetch_frequency_breakdowns(
+                access_token=api_token,
+                ad_account_id=api_account_id,
+                date_start=api_date_start.strftime("%Y-%m-%d"),
+                date_stop=api_date_stop.strftime("%Y-%m-%d"),
+            )
+        cache_path = _save_cache(
+            df, freq_data,
+            account_id=api_account_id,
             date_start=api_date_start.strftime("%Y-%m-%d"),
             date_stop=api_date_stop.strftime("%Y-%m-%d"),
+        )
+        st.sidebar.success(f"Saved to cache: {cache_path.name}")
+        _src_label = (
+            f"Data source: Meta Marketing API  |  "
+            f"{api_date_start} → {api_date_stop}  |  "
+            f"Account {api_account_id}"
         )
 
     if df.empty:
         st.stop()
 
-    with st.spinner("Fetching reach & frequency breakdowns from Meta API…"):
-        freq_data = fetch_frequency_breakdowns(
-            access_token=api_token,
-            ad_account_id=api_account_id,
-            date_start=api_date_start.strftime("%Y-%m-%d"),
-            date_stop=api_date_stop.strftime("%Y-%m-%d"),
-        )
-
-    st.caption(
-        f"Data source: Meta Marketing API  |  "
-        f"{api_date_start} → {api_date_stop}  |  "
-        f"Account {api_account_id}"
-    )
+    st.caption(_src_label)
 
     min_date = df["Reporting starts"].min()
     max_date = df["Reporting starts"].max()
@@ -966,8 +1080,11 @@ def main() -> None:
                 "CTR %": "#00D1FF",
                 "CVR % (Result/Click)": "#FF4D6D",
             }
+            _ctr_cvr_df = daily.copy()
+            _ctr_cvr_df["CTR %"] = pd.to_numeric(_ctr_cvr_df["CTR %"], errors="coerce")
+            _ctr_cvr_df["CVR % (Result/Click)"] = pd.to_numeric(_ctr_cvr_df["CVR % (Result/Click)"], errors="coerce")
             ctr_cvr_fig = px.line(
-                daily,
+                _ctr_cvr_df,
                 x="Reporting starts",
                 y=["CTR %", "CVR % (Result/Click)"],
                 markers=True,
@@ -1499,191 +1616,127 @@ def main() -> None:
             filtered_df, ad_alldays_df=freq_data.get("ad_alldays")
         )
 
-        if attr_health_daily is None:
-            st.warning("Attribution setting data not available in this dataset.")
+        if attr_health_daily is None and ad_attr_summary is None:
+            st.warning("No data available for this tab.")
         else:
-            attr_health_daily_sorted = attr_health_daily.sort_values("Reporting starts")
+            if attr_health_daily is not None:
+                attr_health_daily_sorted = attr_health_daily.sort_values("Reporting starts")
+            else:
+                attr_health_daily_sorted = None
 
-            attr_cols = [c for c in attr_daily_detail["Attribution setting"].unique() if pd.notna(c)]
-            is_click = any("click" in str(c).lower() for c in attr_cols)
-            is_view = any("view" in str(c).lower() for c in attr_cols)
+            if attr_daily_detail is not None:
+                attr_cols = [c for c in attr_daily_detail["Attribution setting"].unique() if pd.notna(c)]
+            else:
+                attr_cols = []
+            # Only treat as separate-attribution data when there are genuinely distinct
+            # click-only and view-only rows (NOT the combined "7-day click or 1-day view" value).
+            click_only_cols = [c for c in attr_cols if "click" in str(c).lower() and "view" not in str(c).lower()]
+            view_only_cols  = [c for c in attr_cols if "view"  in str(c).lower() and "click" not in str(c).lower()]
+            is_click = bool(click_only_cols)
+            is_view  = bool(view_only_cols)
 
-            if is_click and is_view:
+            if is_click and is_view and attr_health_daily_sorted is not None:
                 pivot_results = attr_daily_detail.pivot_table(
                     index="Reporting starts",
                     columns="Attribution setting",
                     values="Results",
                     aggfunc="sum",
-                    fill_value=0
+                    fill_value=0,
                 )
-
                 click_col = next((c for c in pivot_results.columns if "click" in str(c).lower()), None)
                 view_col = next((c for c in pivot_results.columns if "view" in str(c).lower()), None)
 
-                fig_attr = go.Figure()
+                # daily Results per $100 for the overlay
+                roas_daily = attr_health_daily_sorted.copy()
+                roas_daily["Results per $100"] = pd.to_numeric(
+                    _safe_divide(roas_daily["Results"] * 100, roas_daily["Amount spent (USD)"]),
+                    errors="coerce",
+                )
 
+                fig_attr = go.Figure()
                 if click_col:
                     fig_attr.add_trace(go.Bar(
                         x=pivot_results.index,
                         y=pivot_results[click_col],
-                        name="Click-Based Conversions",
+                        name="7-Day Click Sales",
                         yaxis="y1",
-                        marker_color="#1f77b4",
+                        marker_color="#FF8C00",
                     ))
                 if view_col:
                     fig_attr.add_trace(go.Bar(
                         x=pivot_results.index,
                         y=pivot_results[view_col],
-                        name="View-Based Conversions",
+                        name="1-Day View Sales",
                         yaxis="y1",
-                        marker_color="#ff7f0e",
+                        marker_color="#1A6FD4",
                     ))
-
                 fig_attr.add_trace(go.Scatter(
-                    x=attr_health_daily_sorted["Reporting starts"],
-                    y=attr_health_daily_sorted["Frequency"],
-                    name="Frequency",
+                    x=roas_daily["Reporting starts"],
+                    y=roas_daily["Results per $100"],
+                    name="Results per $100",
                     yaxis="y2",
                     mode="lines+markers",
-                    line=dict(color="#2ca02c", width=3),
+                    line=dict(color="#FF4D6D", width=3),
                 ))
-
-                freq_series = pd.to_numeric(attr_health_daily_sorted["Frequency"], errors="coerce")
-                if overlay_enabled("Attribution Frequency Trend") and freq_series.notna().sum() >= 5:
-                    freq_roll_mean = freq_series.rolling(14, min_periods=5).mean()
-                    freq_roll_std = freq_series.rolling(14, min_periods=5).std(ddof=0)
-                    if interval_mode == "predictive":
-                        freq_roll_mean = freq_roll_mean.shift(1)
-                        freq_roll_std = freq_roll_std.shift(1)
-                    freq_upper = freq_roll_mean + 1.96 * freq_roll_std
-                    freq_lower = freq_roll_mean - 1.96 * freq_roll_std
-                    if show_ci_bands:
-                        fig_attr.add_trace(go.Scatter(
-                            x=attr_health_daily_sorted["Reporting starts"],
-                            y=freq_upper,
-                            yaxis="y2",
-                            mode="lines",
-                            line=dict(width=0),
-                            hoverinfo="skip",
-                            showlegend=False,
-                            name="Frequency 95% Upper",
-                        ))
-                        fig_attr.add_trace(go.Scatter(
-                            x=attr_health_daily_sorted["Reporting starts"],
-                            y=freq_lower,
-                            yaxis="y2",
-                            mode="lines",
-                            line=dict(width=0),
-                            fill="tonexty",
-                            fillcolor="rgba(44, 160, 44, 0.14)",
-                            hoverinfo="skip",
-                            showlegend=False,
-                            name="Frequency 95% CI",
-                        ))
-
-                    freq_anomaly = (freq_series > freq_upper) | (freq_series < freq_lower)
-                    if show_anomaly_markers and freq_anomaly.fillna(False).any():
-                        fig_attr.add_trace(go.Scatter(
-                            x=attr_health_daily_sorted.loc[freq_anomaly, "Reporting starts"],
-                            y=freq_series[freq_anomaly],
-                            yaxis="y2",
-                            mode="markers",
-                            marker=dict(color="red", size=9, symbol="x"),
-                            name="Frequency anomaly",
-                        ))
-
                 fig_attr.update_layout(
-                    title="Frequency vs Attribution Split (7D Click vs 1D View)",
+                    title="Where Does Click ROAS Drop? (7-Day Click vs 1-Day View Sales)",
                     barmode="stack",
-                    yaxis=dict(title="Conversions (Stacked)"),
-                    yaxis2=dict(title="Frequency", overlaying="y", side="right"),
+                    yaxis=dict(title="Sales"),
+                    yaxis2=dict(title="Results per $100 Spent", overlaying="y", side="right"),
                     hovermode="x unified",
                 )
                 st.plotly_chart(fig_attr, width="stretch")
 
-            st.subheader("Frequency Ceiling Analysis (Click-Based ROAS)")
-            if ad_attr_summary is not None and "ROAS" in ad_attr_summary.columns:
-                scatter_data = ad_attr_summary[
-                    (ad_attr_summary["Frequency"].notna()) & 
-                    (ad_attr_summary["ROAS"].notna()) &
-                    (ad_attr_summary["Frequency"] > 0) &
-                    (ad_attr_summary["ROAS"] > 0)
-                ].copy()
-
-                if not scatter_data.empty:
-                    fig_ceiling = px.scatter(
-                        scatter_data,
-                        x="Frequency",
-                        y="ROAS",
-                        size="Amount spent (USD)",
-                        color="CTR %",
-                        hover_name="Ad name",
-                        hover_data=["Amount spent (USD)", "Scaling Efficiency Index"],
-                        title="Frequency Ceiling: Where Does Click-ROAS Drop?",
-                        labels={"Frequency": "Weekly Frequency", "ROAS": "7-Day Click ROAS"},
-                    )
-                    fig_ceiling.add_hline(
-                        y=scatter_data["ROAS"].median(),
-                        line_dash="dash",
-                        line_color="red",
-                        annotation_text="Median ROAS",
-                    )
-                    st.plotly_chart(fig_ceiling, width="stretch")
-
-                    freq_threshold = 2.5
-                    target_roas = scatter_data["ROAS"].quantile(0.75)
-
-                    st.subheader("Scaling Alert Status")
-                    alert_col1, alert_col2, alert_col3 = st.columns(3)
-
-                    green_count = len(scatter_data[(scatter_data["Frequency"] < freq_threshold) & (scatter_data["ROAS"] > target_roas)])
-                    yellow_count = len(scatter_data[(scatter_data["Frequency"] >= freq_threshold) & (scatter_data["ROAS"] >= target_roas * 0.8)])
-                    red_count = len(scatter_data[(scatter_data["Frequency"] >= freq_threshold) & (scatter_data["ROAS"] < target_roas * 0.8)])
-
-                    with alert_col1:
-                        st.metric("🟢 Continue Scaling", green_count, help=f"Frequency < {freq_threshold} AND ROAS > {target_roas:.2f}")
-                    with alert_col2:
-                        st.metric("🟡 Monitor (High Intent)", yellow_count, help=f"Frequency ≥ {freq_threshold} AND ROAS stable")
-                    with alert_col3:
-                        st.metric("🔴 Refresh Creative", red_count, help=f"Frequency ≥ {freq_threshold} AND ROAS declining")
-
-                    st.subheader("Ad Scaling Status Breakdown")
-                    status_df = scatter_data.copy()
-                    status_df["Scaling Status"] = "🟡 Monitor"
-                    status_df.loc[(status_df["Frequency"] < freq_threshold) & (status_df["ROAS"] > target_roas), "Scaling Status"] = "🟢 Continue Scaling"
-                    status_df.loc[(status_df["Frequency"] >= freq_threshold) & (status_df["ROAS"] < target_roas * 0.8), "Scaling Status"] = "🔴 Refresh Creative"
-
-                    st.dataframe(
-                        status_df[[
-                            "Ad name",
-                            "Ad delivery",
-                            "Amount spent (USD)",
-                            "Frequency",
-                            "ROAS",
-                            "Scaling Efficiency Index",
-                            "CPM",
-                            "CTR %",
-                            "Scaling Status",
-                        ]].sort_values("Scaling Efficiency Index", ascending=False),
-                        width="stretch",
-                        hide_index=True,
-                    )
-
-                    st.subheader("Scaling Efficiency Index (ROAS / Frequency)")
-                    efficiency_fig = px.bar(
-                        status_df.sort_values("Scaling Efficiency Index", ascending=False).head(15),
-                        x="Ad name",
-                        y="Scaling Efficiency Index",
-                        color="Scaling Status",
-                        hover_data=["Frequency", "ROAS"],
-                        title="Top Ads by Scaling Efficiency",
-                        color_discrete_map={
-                            "🟢 Continue Scaling": "#00cc96",
-                            "🟡 Monitor": "#ffa15a",
-                            "🔴 Refresh Creative": "#ef553b",
-                        },
-                    )
-                    st.plotly_chart(efficiency_fig, width="stretch")
+            elif attr_health_daily_sorted is not None:
+                roas_daily = attr_health_daily_sorted.copy()
+                has_window_split = (
+                    "Results (7d_click)" in roas_daily.columns
+                    and (pd.to_numeric(roas_daily["Results (7d_click)"], errors="coerce") > 0).any()
+                )
+                roas_daily["Results per $100"] = pd.to_numeric(
+                    _safe_divide(roas_daily["Results"] * 100, roas_daily["Amount spent (USD)"]),
+                    errors="coerce",
+                )
+                fig_roas = go.Figure()
+                if has_window_split:
+                    fig_roas.add_trace(go.Bar(
+                        x=roas_daily["Reporting starts"],
+                        y=pd.to_numeric(roas_daily["Results (7d_click)"], errors="coerce"),
+                        name="7-Day Click Sales",
+                        yaxis="y1",
+                        marker_color="#FF8C00",
+                    ))
+                    fig_roas.add_trace(go.Bar(
+                        x=roas_daily["Reporting starts"],
+                        y=pd.to_numeric(roas_daily["Results (1d_view)"], errors="coerce"),
+                        name="1-Day View Sales",
+                        yaxis="y1",
+                        marker_color="#1A6FD4",
+                    ))
+                else:
+                    fig_roas.add_trace(go.Bar(
+                        x=roas_daily["Reporting starts"],
+                        y=pd.to_numeric(roas_daily["Results"], errors="coerce"),
+                        name="Daily Sales",
+                        yaxis="y1",
+                        marker_color="#FF8C00",
+                    ))
+                fig_roas.add_trace(go.Scatter(
+                    x=roas_daily["Reporting starts"],
+                    y=roas_daily["Results per $100"],
+                    name="Results per $100",
+                    yaxis="y2",
+                    mode="lines+markers",
+                    line=dict(color="#FF4D6D", width=3),
+                ))
+                fig_roas.update_layout(
+                    title="Where Does Click ROAS Drop? (7-Day Click vs 1-Day View Sales)",
+                    barmode="stack",
+                    yaxis=dict(title="Sales"),
+                    yaxis2=dict(title="Results per $100 Spent", overlaying="y", side="right"),
+                    hovermode="x unified",
+                )
+                st.plotly_chart(fig_roas, width="stretch")
 
     with tabs[8]:
         st.subheader("CPM Trends of Ads")
