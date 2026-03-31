@@ -1,58 +1,166 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path.home() / ".metaads.env")
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-
-CSV_PATH = Path(__file__).parent / "victim2.csv"
-# CSV_PATH = Path(__file__).parent / "Gentle-Gator-Golf-Ads-Ads-Jun-1-2025-Aug-31-2025.csv"
-
-NUMERIC_COLUMNS = [
-    "Results",
-    "Reach",
-    "Frequency",
-    "Cost per results",
-    "Ad set budget",
-    "Amount spent (USD)",
-    "Impressions",
-    "CPM (cost per 1,000 impressions) (USD)",
-    "Link clicks",
-    "shop_clicks",
-    "CPC (cost per link click) (USD)",
-    "CTR (link click-through rate)",
-    "Clicks (all)",
-    "CTR (all)",
-    "CPC (all) (USD)",
-    "Landing page views",
-    "Cost per landing page view (USD)",
-]
+from facebook_business.api import FacebookAdsApi
+from facebook_business.adobjects.adaccount import AdAccount
+from facebook_business.adobjects.adsinsights import AdsInsights
 
 
-def _coerce_numeric(series: pd.Series) -> pd.Series:
-    cleaned = (
-        series.astype(str)
-        .str.replace(",", "", regex=False)
-        .str.replace("-", "", regex=False)
-        .str.strip()
-        .replace({"": pd.NA, "nan": pd.NA})
-    )
-    return pd.to_numeric(cleaned, errors="coerce")
+def fetch_from_api(
+    access_token: str,
+    ad_account_id: str,
+    date_start: str,
+    date_stop: str,
+) -> pd.DataFrame:
+    """Fetch ad insights from the Meta Marketing API and return a DataFrame."""
+    FacebookAdsApi.init(access_token=access_token)
 
+    account_id = ad_account_id if ad_account_id.startswith("act_") else f"act_{ad_account_id}"
+    account = AdAccount(account_id)
 
-@st.cache_data
-def load_data(csv_path: Path) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
+    fields = [
+        AdsInsights.Field.ad_id,
+        AdsInsights.Field.ad_name,
+        AdsInsights.Field.adset_id,
+        AdsInsights.Field.adset_name,
+        AdsInsights.Field.campaign_id,
+        AdsInsights.Field.campaign_name,
+        AdsInsights.Field.date_start,
+        AdsInsights.Field.date_stop,
+        AdsInsights.Field.reach,
+        AdsInsights.Field.frequency,
+        AdsInsights.Field.spend,
+        AdsInsights.Field.impressions,
+        AdsInsights.Field.cpm,
+        AdsInsights.Field.cpc,
+        AdsInsights.Field.ctr,
+        AdsInsights.Field.clicks,
+        AdsInsights.Field.actions,
+        AdsInsights.Field.cost_per_action_type,
+        AdsInsights.Field.video_thruplay_watched_actions,
+        AdsInsights.Field.video_p25_watched_actions,
+        AdsInsights.Field.video_p50_watched_actions,
+        AdsInsights.Field.video_p75_watched_actions,
+        AdsInsights.Field.video_p95_watched_actions,
+        AdsInsights.Field.video_play_actions,
+        AdsInsights.Field.purchase_roas,
+        AdsInsights.Field.unique_link_clicks_ctr,
+        AdsInsights.Field.unique_clicks,
+        AdsInsights.Field.unique_ctr,
+    ]
 
+    params = {
+        "time_range": {"since": date_start, "until": date_stop},
+        "time_increment": 1,   # one row per day per ad
+        "level": "ad",
+        "limit": 500,
+    }
+
+    try:
+        insights_cursor = account.get_insights(fields=fields, params=params)
+        insights = list(insights_cursor)
+    except Exception as exc:
+        st.error(f"Meta API error: {exc}")
+        return pd.DataFrame()
+
+    if not insights:
+        st.warning("The API returned no data for the selected date range.")
+        return pd.DataFrame()
+
+    def _get_action(actions_list: list | None, action_type: str) -> float | None:
+        if not actions_list:
+            return None
+        for item in actions_list:
+            if item.get("action_type") == action_type:
+                return float(item.get("value", 0))
+        return None
+
+    def _get_cost_per_action(cpa_list: list | None, action_type: str) -> float | None:
+        if not cpa_list:
+            return None
+        for item in cpa_list:
+            if item.get("action_type") == action_type:
+                return float(item.get("value", 0))
+        return None
+
+    rows = []
+    for ins in insights:
+        d = dict(ins)
+        actions_list = d.get("actions") or []
+        cpa_list = d.get("cost_per_action_type") or []
+        video_thru = d.get("video_thruplay_watched_actions") or []
+        video_p25 = d.get("video_p25_watched_actions") or []
+        video_p50 = d.get("video_p50_watched_actions") or []
+        video_p75 = d.get("video_p75_watched_actions") or []
+        video_p95 = d.get("video_p95_watched_actions") or []
+        video_plays = d.get("video_play_actions") or []
+        purchase_roas = d.get("purchase_roas") or []
+
+        link_clicks = _get_action(actions_list, "link_click")
+        landing_page_views = _get_action(actions_list, "landing_page_view")
+        purchases = _get_action(actions_list, "offsite_conversion.fb_pixel_purchase")
+        video_3s = (float(video_plays[0]["value"]) if video_plays else None)
+        thruplays = (float(video_thru[0]["value"]) if video_thru else None)
+        cost_per_thruplay = _get_cost_per_action(
+            d.get("cost_per_action_type"), "video_thruplay_watched"
+        )
+        roas_value = float(purchase_roas[0]["value"]) if purchase_roas else None
+
+        row = {
+            "Ad name": d.get("ad_name"),
+            "Ad set name": d.get("adset_name"),
+            "Campaign name": d.get("campaign_name"),
+            "Ad delivery": "Active",          # API only returns active-period rows
+            "Reporting starts": d.get("date_start"),
+            "Reporting ends": d.get("date_stop"),
+            "Reach": float(d["reach"]) if d.get("reach") else None,
+            "Frequency": float(d["frequency"]) if d.get("frequency") else None,
+            "Amount spent (USD)": float(d["spend"]) if d.get("spend") else None,
+            "Impressions": float(d["impressions"]) if d.get("impressions") else None,
+            "CPM (cost per 1,000 impressions) (USD)": float(d["cpm"]) if d.get("cpm") else None,
+            "CPC (cost per link click) (USD)": float(d["cpc"]) if d.get("cpc") else None,
+            "CTR (link click-through rate)": float(d["ctr"]) if d.get("ctr") else None,
+            "Clicks (all)": float(d["clicks"]) if d.get("clicks") else None,
+            "CTR (all)": float(d.get("unique_ctr", 0) or 0) or None,
+            "CPC (all) (USD)": float(d["cpc"]) if d.get("cpc") else None,
+            "Link clicks": link_clicks,
+            "shop_clicks": link_clicks,   # best proxy available without custom event
+            "Landing page views": landing_page_views,
+            "Cost per landing page view (USD)": _get_cost_per_action(cpa_list, "landing_page_view"),
+            "Unique link clicks": float(d["unique_clicks"]) if d.get("unique_clicks") else None,
+            "Unique clicks (all)": float(d["unique_clicks"]) if d.get("unique_clicks") else None,
+            "3-second video plays": video_3s,
+            "Cost per 3-second video play (USD)": _get_cost_per_action(cpa_list, "video_view"),
+            "ThruPlays": thruplays,
+            "Cost per ThruPlay (USD)": cost_per_thruplay,
+            "Video plays": video_3s,
+            "Video plays at 25%": float(video_p25[0]["value"]) if video_p25 else None,
+            "Video plays at 50%": float(video_p50[0]["value"]) if video_p50 else None,
+            "Video plays at 75%": float(video_p75[0]["value"]) if video_p75 else None,
+            "Video plays at 95%": float(video_p95[0]["value"]) if video_p95 else None,
+            "Photo clicks": _get_action(actions_list, "photo_view"),
+            "Purchases": purchases,
+            "Purchase ROAS (return on ad spend)": roas_value,
+            "Results": link_clicks,          # default; adjust below per objective
+            "Cost per results": _get_cost_per_action(cpa_list, "link_click"),
+            "Ad set budget": None,           # requires separate adset call; left blank
+            "Viewers": float(d["reach"]) if d.get("reach") else None,
+        }
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
     df["Reporting starts"] = pd.to_datetime(df["Reporting starts"], errors="coerce")
     df["Reporting ends"] = pd.to_datetime(df["Reporting ends"], errors="coerce")
-
-    for column in NUMERIC_COLUMNS:
-        if column in df.columns:
-            df[column] = _coerce_numeric(df[column])
-
     return df
 
 
@@ -457,17 +565,46 @@ def make_kpi_row(filtered_df: pd.DataFrame, daily: pd.DataFrame) -> None:
 def main() -> None:
     st.set_page_config(page_title="Meta Ads Dashboard", layout="wide")
     st.title("Meta Ads Performance Dashboard")
-    st.caption("Data source: Gentle-Gator-Golf Meta Ads export")
 
-    if not CSV_PATH.exists():
-        st.error(f"CSV file not found: {CSV_PATH}")
+    api_token = os.getenv("FB_ACCESS_TOKEN", "")
+    api_account_id = os.getenv("FB_ACCOUNT_ID", "")
+
+    if not api_token or not api_account_id:
+        st.error("FB_ACCESS_TOKEN and FB_ACCOUNT_ID must be set in ~/.metaads.env")
         st.stop()
 
-    df = load_data(CSV_PATH)
+    # ── Sidebar: date range + fetch ───────────────────────────────────────────
+    with st.sidebar:
+        st.header("Meta Ads API")
+        api_date_start = st.date_input("From", value=None, key="fb_date_start")
+        api_date_stop = st.date_input("To", value=None, key="fb_date_stop")
+        fetch_api = st.button("Fetch from API", key="fb_fetch")
+
+    # ── Data loading ──────────────────────────────────────────────────────────
+    if not (api_date_start and api_date_stop):
+        st.info("Pick a date range in the sidebar and click **Fetch from API**.")
+        st.stop()
+
+    if not fetch_api:
+        st.info("Click **Fetch from API** in the sidebar to load data.")
+        st.stop()
+
+    with st.spinner("Fetching data from Meta API…"):
+        df = fetch_from_api(
+            access_token=api_token,
+            ad_account_id=api_account_id,
+            date_start=api_date_start.strftime("%Y-%m-%d"),
+            date_stop=api_date_stop.strftime("%Y-%m-%d"),
+        )
 
     if df.empty:
-        st.warning("No data found in the CSV.")
         st.stop()
+
+    st.caption(
+        f"Data source: Meta Marketing API  |  "
+        f"{api_date_start} → {api_date_stop}  |  "
+        f"Account {api_account_id}"
+    )
 
     min_date = df["Reporting starts"].min()
     max_date = df["Reporting starts"].max()
@@ -561,6 +698,7 @@ def main() -> None:
             "Frequency Fatigue",
             "Scaling & Attribution Health",
             "CPM Trends",
+            "Video Deep Dive",
         ]
     )
 
@@ -1420,6 +1558,260 @@ def main() -> None:
             )
         else:
             st.info("Select at least one ad to display CPM trends.")
+
+    with tabs[9]:
+        st.subheader("Video Deep Dive — Normalized by Impressions")
+
+        VIDEO_COLS = [
+            "Video plays",
+            "Viewers",
+            "3-second video plays",
+            "Video plays at 25%",
+            "Video plays at 50%",
+            "Video plays at 75%",
+            "Video plays at 95%",
+            "ThruPlays",
+            "Photo clicks",
+        ]
+        avail = [c for c in VIDEO_COLS if c in filtered_df.columns and filtered_df[c].notna().any()]
+
+        if not avail:
+            st.info("No video metrics found in this export. Re-export from Meta Ads Manager with video columns enabled.")
+        else:
+            # ── per-ad aggregate ──────────────────────────────────────────────────
+            agg_dict = {"Amount spent (USD)": "sum", "Impressions": "sum", "Reach": "sum", "Link clicks": "sum"}
+            for c in avail:
+                agg_dict[c] = "sum"
+            vid_ad = filtered_df.groupby("Ad name", as_index=False).agg(agg_dict)
+
+            # ── per-day aggregate ─────────────────────────────────────────────────
+            vid_day = filtered_df.groupby("Reporting starts", as_index=False).agg(agg_dict).sort_values("Reporting starts")
+
+            # ── derived rates (per-ad) ────────────────────────────────────────────
+            def rate(df, num, denom, pct=True):
+                r = _safe_divide(df[num], df[denom])
+                return r * 100 if pct else r
+
+            if "3-second video plays" in avail:
+                vid_ad["Hook Rate %"]         = rate(vid_ad, "3-second video plays", "Impressions")
+                vid_day["Hook Rate %"]        = rate(vid_day, "3-second video plays", "Impressions")
+                vid_ad["Cost / 3s Play"]      = _safe_divide(vid_ad["Amount spent (USD)"], vid_ad["3-second video plays"])
+
+            if "ThruPlays" in avail:
+                vid_ad["ThruPlay Rate %"]     = rate(vid_ad, "ThruPlays", "Impressions")
+                vid_day["ThruPlay Rate %"]    = rate(vid_day, "ThruPlays", "Impressions")
+                vid_ad["Cost / ThruPlay"]     = _safe_divide(vid_ad["Amount spent (USD)"], vid_ad["ThruPlays"])
+
+            # Completion funnel columns relative to 3s plays (hook) as base
+            base_col = "3-second video plays" if "3-second video plays" in avail else "Video plays"
+            funnel_stages = {
+                "% Watched 25% (of 3s plays)": "Video plays at 25%",
+                "% Watched 50% (of 3s plays)": "Video plays at 50%",
+                "% Watched 75% (of 3s plays)": "Video plays at 75%",
+                "% Watched 95% (of 3s plays)": "Video plays at 95%",
+                "% ThruPlayed (of 3s plays)": "ThruPlays",
+            }
+            for label, col in funnel_stages.items():
+                if col in avail and base_col in avail:
+                    vid_ad[label] = _safe_divide(vid_ad[col], vid_ad[base_col]) * 100
+
+            if "Link clicks" in vid_ad.columns and "3-second video plays" in avail:
+                vid_ad["CTR from 3s Viewers %"] = _safe_divide(vid_ad["Link clicks"], vid_ad["3-second video plays"]) * 100
+
+            # ── Retention score: average of watch milestones ──────────────────────
+            milestone_rate_cols = [l for l in funnel_stages if l in vid_ad.columns]
+            if milestone_rate_cols:
+                vid_ad["Retention Score"] = vid_ad[milestone_rate_cols].mean(axis=1)
+
+            # ── Hook quality score: hook rate × retention score ───────────────────
+            if "Hook Rate %" in vid_ad.columns and "Retention Score" in vid_ad.columns:
+                vid_ad["Video Score"] = (
+                    vid_ad["Hook Rate %"].fillna(0) * 0.4
+                    + vid_ad["Retention Score"].fillna(0) * 0.4
+                    + vid_ad.get("ThruPlay Rate %", pd.Series(0, index=vid_ad.index)).fillna(0) * 0.2
+                )
+
+            # ═══════════════════════════════════════════════════════════════════════
+            # KPI row
+            # ═══════════════════════════════════════════════════════════════════════
+            kv1, kv2, kv3, kv4, kv5 = st.columns(5)
+            if "3-second video plays" in avail:
+                kv1.metric("Total 3s Plays", f"{int(vid_ad['3-second video plays'].sum()):,}")
+                avg_hook = vid_ad["Hook Rate %"].mean()
+                kv2.metric("Avg Hook Rate", f"{avg_hook:.1f}%" if pd.notna(avg_hook) else "—")
+            if "ThruPlays" in avail:
+                kv3.metric("Total ThruPlays", f"{int(vid_ad['ThruPlays'].sum()):,}")
+                avg_thru = vid_ad["ThruPlay Rate %"].mean()
+                kv4.metric("Avg ThruPlay Rate", f"{avg_thru:.1f}%" if pd.notna(avg_thru) else "—")
+            if "Retention Score" in vid_ad.columns:
+                kv5.metric("Avg Retention Score", f"{vid_ad['Retention Score'].mean():.1f}%")
+
+            st.markdown("---")
+
+            # ═══════════════════════════════════════════════════════════════════════
+            # Row 1 — Hook Rate bar + ThruPlay Rate bar
+            # ═══════════════════════════════════════════════════════════════════════
+            r1c1, r1c2 = st.columns(2)
+            with r1c1:
+                if "Hook Rate %" in vid_ad.columns:
+                    fig_hook = px.bar(
+                        vid_ad.sort_values("Hook Rate %", ascending=False),
+                        x="Ad name", y="Hook Rate %",
+                        hover_data=["Amount spent (USD)", "Impressions", "3-second video plays", "Cost / 3s Play"],
+                        title="Hook Rate by Ad (3s Plays / Impressions)",
+                        color="Hook Rate %",
+                        color_continuous_scale="Blues",
+                    )
+                    fig_hook.update_layout(xaxis_tickangle=-35, yaxis_ticksuffix="%", showlegend=False)
+                    st.plotly_chart(fig_hook, width="stretch")
+
+            with r1c2:
+                if "ThruPlay Rate %" in vid_ad.columns:
+                    fig_thru = px.bar(
+                        vid_ad.sort_values("ThruPlay Rate %", ascending=False),
+                        x="Ad name", y="ThruPlay Rate %",
+                        hover_data=["Amount spent (USD)", "Impressions", "ThruPlays", "Cost / ThruPlay"],
+                        title="ThruPlay Rate by Ad (ThruPlays / Impressions)",
+                        color="ThruPlay Rate %",
+                        color_continuous_scale="Greens",
+                    )
+                    fig_thru.update_layout(xaxis_tickangle=-35, yaxis_ticksuffix="%", showlegend=False)
+                    st.plotly_chart(fig_thru, width="stretch")
+
+            # ═══════════════════════════════════════════════════════════════════════
+            # Row 2 — Retention funnel per ad (grouped bar) + Hook vs ThruPlay scatter
+            # ═══════════════════════════════════════════════════════════════════════
+            r2c1, r2c2 = st.columns(2)
+            with r2c1:
+                funnel_rate_cols = [l for l in funnel_stages if l in vid_ad.columns]
+                if funnel_rate_cols:
+                    funnel_melt = vid_ad[["Ad name"] + funnel_rate_cols].melt(
+                        id_vars="Ad name", var_name="Watch Milestone", value_name="% Retained"
+                    )
+                    milestone_order = list(funnel_stages.keys())
+                    fig_ret = px.bar(
+                        funnel_melt,
+                        x="Ad name", y="% Retained", color="Watch Milestone",
+                        barmode="group",
+                        category_orders={"Watch Milestone": milestone_order},
+                        title="Retention at Each Milestone (% of 3s Plays)",
+                    )
+                    fig_ret.update_layout(xaxis_tickangle=-35, yaxis_ticksuffix="%")
+                    st.plotly_chart(fig_ret, width="stretch")
+
+            with r2c2:
+                if "Hook Rate %" in vid_ad.columns and "ThruPlay Rate %" in vid_ad.columns:
+                    fig_scatter = px.scatter(
+                        vid_ad,
+                        x="Hook Rate %", y="ThruPlay Rate %",
+                        size="Amount spent (USD)",
+                        color="Retention Score" if "Retention Score" in vid_ad.columns else None,
+                        hover_name="Ad name",
+                        hover_data=["Cost / 3s Play", "Cost / ThruPlay", "Amount spent (USD)"],
+                        title="Hook Rate vs ThruPlay Rate (bubble = spend)",
+                        color_continuous_scale="RdYlGn",
+                    )
+                    fig_scatter.update_layout(xaxis_ticksuffix="%", yaxis_ticksuffix="%")
+                    st.plotly_chart(fig_scatter, width="stretch")
+
+            # ═══════════════════════════════════════════════════════════════════════
+            # Row 3 — Aggregated retention funnel waterfall + CTR from 3s viewers
+            # ═══════════════════════════════════════════════════════════════════════
+            r3c1, r3c2 = st.columns(2)
+            with r3c1:
+                all_funnel_cols = [c for c in [
+                    "Video plays", "3-second video plays",
+                    "Video plays at 25%", "Video plays at 50%",
+                    "Video plays at 75%", "Video plays at 95%", "ThruPlays"
+                ] if c in avail]
+                if len(all_funnel_cols) >= 2:
+                    funnel_totals = {c: vid_ad[c].sum() for c in all_funnel_cols}
+                    funnel_labels = {
+                        "Video plays": "Any Play",
+                        "3-second video plays": "3s Hook",
+                        "Video plays at 25%": "25% Watch",
+                        "Video plays at 50%": "50% Watch",
+                        "Video plays at 75%": "75% Watch",
+                        "Video plays at 95%": "95% Watch",
+                        "ThruPlays": "Full / 15s",
+                    }
+                    funnel_df = pd.DataFrame({
+                        "Stage": [funnel_labels[c] for c in all_funnel_cols],
+                        "Count": [funnel_totals[c] for c in all_funnel_cols],
+                    })
+                    fig_funnel = px.funnel(funnel_df, x="Count", y="Stage",
+                                           title="Overall Video Drop-off Funnel (All Ads)")
+                    st.plotly_chart(fig_funnel, width="stretch")
+
+            with r3c2:
+                if "CTR from 3s Viewers %" in vid_ad.columns:
+                    fig_ctr3s = px.bar(
+                        vid_ad.sort_values("CTR from 3s Viewers %", ascending=False),
+                        x="Ad name", y="CTR from 3s Viewers %",
+                        hover_data=["Link clicks", "3-second video plays"],
+                        title="Link CTR Among 3s Viewers (Clicks / 3s Plays)",
+                        color="CTR from 3s Viewers %",
+                        color_continuous_scale="Oranges",
+                    )
+                    fig_ctr3s.update_layout(xaxis_tickangle=-35, yaxis_ticksuffix="%", showlegend=False)
+                    st.plotly_chart(fig_ctr3s, width="stretch")
+
+            # ═══════════════════════════════════════════════════════════════════════
+            # Row 4 — Daily Hook Rate and ThruPlay Rate trends
+            # ═══════════════════════════════════════════════════════════════════════
+            daily_rate_cols = [c for c in ["Hook Rate %", "ThruPlay Rate %"] if c in vid_day.columns]
+            if daily_rate_cols:
+                r4c1, r4c2 = st.columns(2)
+                with r4c1:
+                    raw_daily_cols = [c for c in ["3-second video plays", "ThruPlays", "Video plays"] if c in avail]
+                    fig_raw = px.line(
+                        vid_day, x="Reporting starts", y=raw_daily_cols,
+                        markers=True, title="Daily Video Plays (Raw)"
+                    )
+                    st.plotly_chart(fig_raw, width="stretch")
+                with r4c2:
+                    fig_rates = px.line(
+                        vid_day, x="Reporting starts", y=daily_rate_cols,
+                        markers=True, title="Daily Hook & ThruPlay Rates (% of Impressions)"
+                    )
+                    fig_rates.update_layout(yaxis_ticksuffix="%")
+                    st.plotly_chart(fig_rates, width="stretch")
+
+            # ═══════════════════════════════════════════════════════════════════════
+            # Row 5 — Cost efficiency
+            # ═══════════════════════════════════════════════════════════════════════
+            cost_cols = [c for c in ["Cost / 3s Play", "Cost / ThruPlay"] if c in vid_ad.columns]
+            if cost_cols:
+                r5c1, r5c2 = st.columns(2)
+                cols_iter = iter([r5c1, r5c2])
+                for cost_col in cost_cols:
+                    with next(cols_iter):
+                        fig_cost = px.bar(
+                            vid_ad.dropna(subset=[cost_col]).sort_values(cost_col),
+                            x="Ad name", y=cost_col,
+                            hover_data=["Amount spent (USD)", "Impressions"],
+                            title=f"{cost_col} by Ad (lower = better)",
+                        )
+                        fig_cost.update_layout(xaxis_tickangle=-35)
+                        st.plotly_chart(fig_cost, width="stretch")
+
+            # ═══════════════════════════════════════════════════════════════════════
+            # Video Score leaderboard
+            # ═══════════════════════════════════════════════════════════════════════
+            if "Video Score" in vid_ad.columns:
+                st.subheader("Video Performance Leaderboard")
+                st.caption("Video Score = 40% Hook Rate + 40% Avg Retention + 20% ThruPlay Rate")
+                score_cols = ["Ad name", "Amount spent (USD)", "Impressions"]
+                for c in ["Hook Rate %", "% Watched 25% (of 3s plays)", "% Watched 50% (of 3s plays)",
+                           "% Watched 75% (of 3s plays)", "% ThruPlayed (of 3s plays)",
+                           "ThruPlay Rate %", "Retention Score", "Video Score",
+                           "Cost / 3s Play", "Cost / ThruPlay", "CTR from 3s Viewers %"]:
+                    if c in vid_ad.columns:
+                        score_cols.append(c)
+                st.dataframe(
+                    vid_ad[score_cols].sort_values("Video Score", ascending=False),
+                    width="stretch", hide_index=True
+                )
 
 
 if __name__ == "__main__":
