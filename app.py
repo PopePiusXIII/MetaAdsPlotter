@@ -173,6 +173,149 @@ def _safe_divide(numerator: pd.Series | float, denominator: pd.Series | float) -
     return pd.NA
 
 
+def fetch_frequency_breakdowns(
+    access_token: str,
+    ad_account_id: str,
+    date_start: str,
+    date_stop: str,
+) -> dict:
+    """Fetch true deduplicated reach/frequency via cumulative growing-window API calls.
+
+    For every day D between date_start and date_stop we query the API with
+    time_range={since: date_start, until: D} so that Meta returns the true
+    deduplicated reach for the window day-1 → day-D at each level.
+
+    Returns a dict keyed by:
+        account_daily      – account-level reach/frequency per individual day (for daily summary)
+        ad_alldays         – per-ad reach/frequency over the full date range (for ad summary)
+        account_cumulative – cumulative account-level reach/freq for each end-date
+        adset_cumulative   – cumulative adset-level reach/freq for each end-date
+        ad_cumulative      – cumulative ad-level reach/freq for each end-date
+    """
+    import datetime
+    FacebookAdsApi.init(access_token=access_token)
+    account_id = (
+        ad_account_id if ad_account_id.startswith("act_") else f"act_{ad_account_id}"
+    )
+    account = AdAccount(account_id)
+
+    base_fields = [
+        AdsInsights.Field.date_start,
+        AdsInsights.Field.date_stop,
+        AdsInsights.Field.reach,
+        AdsInsights.Field.impressions,
+        AdsInsights.Field.frequency,
+        AdsInsights.Field.spend,
+    ]
+    ad_name_field = AdsInsights.Field.ad_name
+    adset_name_field = AdsInsights.Field.adset_name
+    full_range = {"since": date_start, "until": date_stop}
+
+    def _raw_fetch(level: str, time_increment, time_range: dict, extra_fields=None, label: str = "") -> list:
+        fields = base_fields + (extra_fields or [])
+        params = {
+            "time_range": time_range,
+            "time_increment": time_increment,
+            "level": level,
+            "limit": 500,
+        }
+        try:
+            return list(account.get_insights(fields=fields, params=params))
+        except Exception as exc:
+            st.warning(f"Meta API: could not fetch {label} data: {exc}")
+            return []
+
+    def _to_df(raw: list, group_cols: dict) -> pd.DataFrame:
+        if not raw:
+            return pd.DataFrame()
+        rows = []
+        for ins in raw:
+            d = dict(ins)
+            row: dict = {out: d.get(api) for out, api in group_cols.items()}
+            row["date_start"] = pd.Timestamp(d["date_start"]) if d.get("date_start") else pd.NaT
+            row["date_stop"] = pd.Timestamp(d["date_stop"]) if d.get("date_stop") else pd.NaT
+            row["reach"] = float(d["reach"]) if d.get("reach") else None
+            row["impressions"] = float(d["impressions"]) if d.get("impressions") else None
+            row["frequency"] = float(d["frequency"]) if d.get("frequency") else None
+            row["spend"] = float(d.get("spend", 0) or 0)
+            rows.append(row)
+        return pd.DataFrame(rows)
+
+    # ── static fetches (unchanged from before) ────────────────────────────────
+    account_daily = _to_df(
+        _raw_fetch("account", 1, full_range, label="account-daily"), {}
+    )
+    ad_alldays = _to_df(
+        _raw_fetch("ad", "all_days", full_range, [ad_name_field, adset_name_field], "ad-alldays"),
+        {"Ad name": "ad_name", "Ad set name": "adset_name"},
+    )
+
+    # ── cumulative growing-window fetches ─────────────────────────────────────
+    # For each end-date D: query since=date_start until=D to get the true
+    # deduplicated reach across day-1 through day-D.
+    start_dt = datetime.date.fromisoformat(date_start)
+    stop_dt = datetime.date.fromisoformat(date_stop)
+    num_days = (stop_dt - start_dt).days + 1
+
+    acct_rows: list[dict] = []
+    adset_rows: list[dict] = []
+    ad_rows: list[dict] = []
+
+    progress = st.progress(0, text="Fetching cumulative frequency data…")
+    for i, offset in enumerate(range(num_days)):
+        end_date = start_dt + datetime.timedelta(days=offset)
+        end_str = end_date.isoformat()
+        window = {"since": date_start, "until": end_str}
+
+        # Account cumulative (1 row per call)
+        for ins in _raw_fetch("account", "all_days", window, label=f"acct-cum-{end_str}"):
+            d = dict(ins)
+            acct_rows.append({
+                "date_stop": pd.Timestamp(end_str),
+                "reach": float(d["reach"]) if d.get("reach") else None,
+                "impressions": float(d["impressions"]) if d.get("impressions") else None,
+                "frequency": float(d["frequency"]) if d.get("frequency") else None,
+                "spend": float(d.get("spend", 0) or 0),
+            })
+
+        # Adset cumulative (1 row per adset per call)
+        for ins in _raw_fetch("adset", "all_days", window, [adset_name_field], f"adset-cum-{end_str}"):
+            d = dict(ins)
+            adset_rows.append({
+                "date_stop": pd.Timestamp(end_str),
+                "Ad set name": d.get("adset_name"),
+                "reach": float(d["reach"]) if d.get("reach") else None,
+                "impressions": float(d["impressions"]) if d.get("impressions") else None,
+                "frequency": float(d["frequency"]) if d.get("frequency") else None,
+                "spend": float(d.get("spend", 0) or 0),
+            })
+
+        # Ad cumulative (1 row per ad per call)
+        for ins in _raw_fetch("ad", "all_days", window, [ad_name_field, adset_name_field], f"ad-cum-{end_str}"):
+            d = dict(ins)
+            ad_rows.append({
+                "date_stop": pd.Timestamp(end_str),
+                "Ad name": d.get("ad_name"),
+                "Ad set name": d.get("adset_name"),
+                "reach": float(d["reach"]) if d.get("reach") else None,
+                "impressions": float(d["impressions"]) if d.get("impressions") else None,
+                "frequency": float(d["frequency"]) if d.get("frequency") else None,
+                "spend": float(d.get("spend", 0) or 0),
+            })
+
+        progress.progress((i + 1) / num_days, text=f"Fetching cumulative frequency data… day {i + 1}/{num_days}")
+
+    progress.empty()
+
+    return {
+        "account_daily": account_daily,
+        "ad_alldays": ad_alldays,
+        "account_cumulative": pd.DataFrame(acct_rows) if acct_rows else pd.DataFrame(),
+        "adset_cumulative": pd.DataFrame(adset_rows) if adset_rows else pd.DataFrame(),
+        "ad_cumulative": pd.DataFrame(ad_rows) if ad_rows else pd.DataFrame(),
+    }
+
+
 def add_95_confidence_bounds(
     fig: go.Figure,
     df: pd.DataFrame,
@@ -307,7 +450,7 @@ def add_95_confidence_bounds(
     return fig
 
 
-def make_daily_summary(filtered_df: pd.DataFrame) -> pd.DataFrame:
+def make_daily_summary(filtered_df: pd.DataFrame, account_daily_df: pd.DataFrame | None = None) -> pd.DataFrame:
     daily = (
         filtered_df.groupby("Reporting starts", as_index=False)
         .agg(
@@ -324,7 +467,20 @@ def make_daily_summary(filtered_df: pd.DataFrame) -> pd.DataFrame:
     )
 
     daily["Cost per Result"] = _safe_divide(daily["Amount spent (USD)"], daily["Results"])
-    daily["Frequency"] = _safe_divide(daily["Impressions"], daily["Reach"])
+    if account_daily_df is not None and not account_daily_df.empty:
+        acct = account_daily_df[["date_start", "reach", "frequency"]].copy()
+        acct = acct.rename(
+            columns={"date_start": "Reporting starts", "reach": "Account Reach", "frequency": "Frequency"}
+        )
+        acct["Reporting starts"] = pd.to_datetime(acct["Reporting starts"])
+        daily = daily.merge(acct, on="Reporting starts", how="left")
+        daily["Reach"] = daily["Account Reach"].combine_first(daily["Reach"])
+        daily = daily.drop(columns=["Account Reach"])
+        daily["Frequency"] = daily["Frequency"].combine_first(
+            _safe_divide(daily["Impressions"], daily["Reach"])
+        )
+    else:
+        daily["Frequency"] = _safe_divide(daily["Impressions"], daily["Reach"])
     daily["CTR %"] = _safe_divide(daily["Link clicks"], daily["Impressions"]) * 100
     daily["CPM"] = _safe_divide(daily["Amount spent (USD)"] * 1000, daily["Impressions"])
     daily["CPC"] = _safe_divide(daily["Amount spent (USD)"], daily["Link clicks"])
@@ -351,7 +507,7 @@ def make_daily_summary(filtered_df: pd.DataFrame) -> pd.DataFrame:
     return daily
 
 
-def make_ad_summary(filtered_df: pd.DataFrame) -> pd.DataFrame:
+def make_ad_summary(filtered_df: pd.DataFrame, ad_alldays_df: pd.DataFrame | None = None) -> pd.DataFrame:
     ad_summary = (
         filtered_df.groupby(["Ad name", "Ad delivery"], as_index=False)
         .agg(
@@ -376,7 +532,19 @@ def make_ad_summary(filtered_df: pd.DataFrame) -> pd.DataFrame:
     ad_summary["Results per $100"] = _safe_divide(ad_summary["Results"] * 100, ad_summary["Amount spent (USD)"])
     ad_summary["Clicks per $100"] = _safe_divide(ad_summary["Link clicks"] * 100, ad_summary["Amount spent (USD)"])
     ad_summary["LPV per $100"] = _safe_divide(ad_summary["Landing page views"] * 100, ad_summary["Amount spent (USD)"])
-    ad_summary["Frequency"] = _safe_divide(ad_summary["Impressions"], ad_summary["Reach"])
+    if ad_alldays_df is not None and not ad_alldays_df.empty and "Ad name" in ad_alldays_df.columns:
+        freq_lookup = (
+            ad_alldays_df[["Ad name", "frequency"]]
+            .rename(columns={"frequency": "Frequency"})
+        )
+        ad_summary = ad_summary.merge(freq_lookup, on="Ad name", how="left")
+        missing = ad_summary["Frequency"].isna()
+        if missing.any():
+            ad_summary.loc[missing, "Frequency"] = _safe_divide(
+                ad_summary.loc[missing, "Impressions"], ad_summary.loc[missing, "Reach"]
+            )
+    else:
+        ad_summary["Frequency"] = _safe_divide(ad_summary["Impressions"], ad_summary["Reach"])
 
     ad_summary["Estimated New Impressions"] = ad_summary[["Reach", "Impressions"]].min(axis=1)
     ad_summary["Estimated Returning Impressions"] = (
@@ -403,7 +571,19 @@ def make_ad_summary(filtered_df: pd.DataFrame) -> pd.DataFrame:
     return ad_summary.sort_values("Amount spent (USD)", ascending=False)
 
 
-def make_rolling_frequency_summary(filtered_df: pd.DataFrame, group_col: str) -> pd.DataFrame:
+def make_rolling_frequency_summary(
+    filtered_df: pd.DataFrame,
+    group_col: str,
+    cumulative_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Build a per-(day, group) frequency table.
+
+    "Daily Frequency"      = per-day Impressions / per-day Reach (always present).
+    "Cumulative Frequency" = true deduplicated frequency from campaign start to that day,
+                             sourced from the API cumulative calls.  Each row's x-value
+                             (Reporting starts / date_stop) represents the end of the
+                             growing window that started on the first day of the fetch.
+    """
     freq_df = (
         filtered_df.groupby(["Reporting starts", group_col], as_index=False)
         .agg({"Impressions": "sum", "Reach": "sum", "Amount spent (USD)": "sum"})
@@ -412,56 +592,49 @@ def make_rolling_frequency_summary(filtered_df: pd.DataFrame, group_col: str) ->
 
     freq_df["Daily Frequency"] = _safe_divide(freq_df["Impressions"], freq_df["Reach"])
 
-    overlap_assumption = 0.70
-    incremental_unique_share = 1 - overlap_assumption
+    if cumulative_df is not None and not cumulative_df.empty:
+        if group_col in cumulative_df.columns:
+            lookup = (
+                cumulative_df[["date_stop", group_col, "reach", "impressions", "frequency", "spend"]]
+                .copy()
+                .rename(columns={
+                    "date_stop": "Reporting starts",
+                    "reach": "Cumulative Reach",
+                    "impressions": "Cumulative Impressions",
+                    "frequency": "Cumulative Frequency",
+                    "spend": "Cumulative Spend",
+                })
+            )
+            freq_df = freq_df.merge(lookup, on=["Reporting starts", group_col], how="left")
+        else:
+            # Account-level cumulative has no group column
+            lookup = (
+                cumulative_df[["date_stop", "reach", "impressions", "frequency", "spend"]]
+                .copy()
+                .rename(columns={
+                    "date_stop": "Reporting starts",
+                    "reach": "Cumulative Reach",
+                    "impressions": "Cumulative Impressions",
+                    "frequency": "Cumulative Frequency",
+                    "spend": "Cumulative Spend",
+                })
+            )
+            freq_df = freq_df.merge(lookup, on="Reporting starts", how="left")
+    else:
+        freq_df["Cumulative Reach"] = None
+        freq_df["Cumulative Impressions"] = None
+        freq_df["Cumulative Frequency"] = None
+        freq_df["Cumulative Spend"] = None
 
-    freq_df["Rolling Impressions (7D)"] = (
-        freq_df.groupby(group_col)["Impressions"].rolling(7, min_periods=1).sum().reset_index(level=0, drop=True)
-    )
-    freq_df["Rolling Spend (7D)"] = (
-        freq_df.groupby(group_col)["Amount spent (USD)"].rolling(7, min_periods=1).sum().reset_index(level=0, drop=True)
-    )
-    freq_df["Rolling Reach Sum (7D)"] = (
-        freq_df.groupby(group_col)["Reach"].rolling(7, min_periods=1).sum().reset_index(level=0, drop=True)
-    )
-    freq_df["Rolling Reach Max (7D)"] = (
-        freq_df.groupby(group_col)["Reach"].rolling(7, min_periods=1).max().reset_index(level=0, drop=True)
-    )
-    freq_df["Estimated Unique Accounts (7D)"] = (
-        freq_df["Rolling Reach Max (7D)"]
-        + (freq_df["Rolling Reach Sum (7D)"] - freq_df["Rolling Reach Max (7D)"]).clip(lower=0)
-        * incremental_unique_share
-    )
-
-    freq_df["Rolling Impressions (30D)"] = (
-        freq_df.groupby(group_col)["Impressions"].rolling(30, min_periods=1).sum().reset_index(level=0, drop=True)
-    )
-    freq_df["Rolling Spend (30D)"] = (
-        freq_df.groupby(group_col)["Amount spent (USD)"].rolling(30, min_periods=1).sum().reset_index(level=0, drop=True)
-    )
-    freq_df["Rolling Reach Sum (30D)"] = (
-        freq_df.groupby(group_col)["Reach"].rolling(30, min_periods=1).sum().reset_index(level=0, drop=True)
-    )
-    freq_df["Rolling Reach Max (30D)"] = (
-        freq_df.groupby(group_col)["Reach"].rolling(30, min_periods=1).max().reset_index(level=0, drop=True)
-    )
-    freq_df["Estimated Unique Accounts (30D)"] = (
-        freq_df["Rolling Reach Max (30D)"]
-        + (freq_df["Rolling Reach Sum (30D)"] - freq_df["Rolling Reach Max (30D)"]).clip(lower=0)
-        * incremental_unique_share
-    )
-
-    freq_df["Weekly Rolling Frequency (7D)"] = _safe_divide(
-        freq_df["Rolling Impressions (7D)"], freq_df["Estimated Unique Accounts (7D)"]
-    )
-    freq_df["Monthly Rolling Frequency (30D)"] = _safe_divide(
-        freq_df["Rolling Impressions (30D)"], freq_df["Estimated Unique Accounts (30D)"]
-    )
+    for _c in ["Daily Frequency", "Cumulative Reach", "Cumulative Impressions",
+               "Cumulative Frequency", "Cumulative Spend"]:
+        if _c in freq_df.columns:
+            freq_df[_c] = pd.to_numeric(freq_df[_c], errors="coerce")
 
     return freq_df
 
 
-def make_attribution_health_summary(filtered_df: pd.DataFrame):
+def make_attribution_health_summary(filtered_df: pd.DataFrame, account_daily_df: pd.DataFrame | None = None):
     """Create daily summary split by attribution type (7-day click vs 1-day view)."""
     if "Attribution setting" not in filtered_df.columns:
         return None, None
@@ -491,12 +664,25 @@ def make_attribution_health_summary(filtered_df: pd.DataFrame):
             "Amount spent (USD)": "sum",
         })
     )
-    daily_agg["Frequency"] = _safe_divide(daily_agg["Impressions"], daily_agg["Reach"])
-    
+    if account_daily_df is not None and not account_daily_df.empty:
+        acct = account_daily_df[["date_start", "reach", "frequency"]].copy()
+        acct = acct.rename(
+            columns={"date_start": "Reporting starts", "reach": "Account Reach", "frequency": "Frequency"}
+        )
+        acct["Reporting starts"] = pd.to_datetime(acct["Reporting starts"])
+        daily_agg = daily_agg.merge(acct, on="Reporting starts", how="left")
+        daily_agg["Reach"] = daily_agg["Account Reach"].combine_first(daily_agg["Reach"])
+        daily_agg = daily_agg.drop(columns=["Account Reach"])
+        daily_agg["Frequency"] = daily_agg["Frequency"].combine_first(
+            _safe_divide(daily_agg["Impressions"], daily_agg["Reach"])
+        )
+    else:
+        daily_agg["Frequency"] = _safe_divide(daily_agg["Impressions"], daily_agg["Reach"])
+
     return daily_agg, attr_daily
 
 
-def make_attribution_ad_summary(filtered_df: pd.DataFrame):
+def make_attribution_ad_summary(filtered_df: pd.DataFrame, ad_alldays_df: pd.DataFrame | None = None):
     """Create ad summary with attribution and scaling analysis."""
     if "Attribution setting" not in filtered_df.columns:
         return None
@@ -511,12 +697,24 @@ def make_attribution_ad_summary(filtered_df: pd.DataFrame):
             "Link clicks": "sum",
         })
     )
-    ad_agg["Frequency"] = _safe_divide(ad_agg["Impressions"], ad_agg["Reach"])
+    if ad_alldays_df is not None and not ad_alldays_df.empty and "Ad name" in ad_alldays_df.columns:
+        freq_lookup = (
+            ad_alldays_df[["Ad name", "frequency"]]
+            .rename(columns={"frequency": "Frequency"})
+        )
+        ad_agg = ad_agg.merge(freq_lookup, on="Ad name", how="left")
+        missing = ad_agg["Frequency"].isna()
+        if missing.any():
+            ad_agg.loc[missing, "Frequency"] = _safe_divide(
+                ad_agg.loc[missing, "Impressions"], ad_agg.loc[missing, "Reach"]
+            )
+    else:
+        ad_agg["Frequency"] = _safe_divide(ad_agg["Impressions"], ad_agg["Reach"])
     ad_agg["CPM"] = _safe_divide(ad_agg["Amount spent (USD)"] * 1000, ad_agg["Impressions"])
     ad_agg["CTR %"] = _safe_divide(ad_agg["Link clicks"], ad_agg["Impressions"]) * 100
     ad_agg["ROAS"] = _safe_divide(ad_agg["Results"], ad_agg["Amount spent (USD)"])
     ad_agg["Scaling Efficiency Index"] = _safe_divide(ad_agg["ROAS"], ad_agg["Frequency"])
-    
+
     return ad_agg
 
 
@@ -600,6 +798,14 @@ def main() -> None:
     if df.empty:
         st.stop()
 
+    with st.spinner("Fetching reach & frequency breakdowns from Meta API…"):
+        freq_data = fetch_frequency_breakdowns(
+            access_token=api_token,
+            ad_account_id=api_account_id,
+            date_start=api_date_start.strftime("%Y-%m-%d"),
+            date_stop=api_date_stop.strftime("%Y-%m-%d"),
+        )
+
     st.caption(
         f"Data source: Meta Marketing API  |  "
         f"{api_date_start} → {api_date_stop}  |  "
@@ -682,8 +888,8 @@ def main() -> None:
         st.warning("No rows match the current filter selection.")
         st.stop()
 
-    daily = make_daily_summary(filtered_df)
-    ad_summary = make_ad_summary(filtered_df)
+    daily = make_daily_summary(filtered_df, account_daily_df=freq_data.get("account_daily"))
+    ad_summary = make_ad_summary(filtered_df, ad_alldays_df=freq_data.get("ad_alldays"))
 
     make_kpi_row(filtered_df, daily)
 
@@ -949,9 +1155,10 @@ def main() -> None:
         )
 
     with tabs[4]:
-        st.subheader("Ad Set Daily / Weekly / Monthly Rolling Frequency")
+        st.subheader("Ad Set Cumulative Frequency")
         st.caption(
-            "7D/30D frequency uses an accounts-based unique reach estimate (assumes 70% overlap in daily reached accounts)."
+            "Cumulative frequency = true deduplicated reach queried from the Meta API "
+            "growing from day 1 of the selected period through each successive day."
         )
 
         adset_col = "Ad set name" if "Ad set name" in filtered_df.columns else None
@@ -959,35 +1166,39 @@ def main() -> None:
             adset_source = filtered_df.copy()
             adset_source["Ad Set"] = "Selected Ads Aggregate"
             adset_col = "Ad Set"
-            st.caption("`Ad set name` column is not available in this CSV, so this tab shows aggregate selected ads.")
+            st.caption("`Ad set name` column is not available — showing aggregate.")
         else:
             adset_source = filtered_df
 
-        adset_freq = make_rolling_frequency_summary(adset_source, adset_col)
+        if adset_col == "Ad set name":
+            _adset_cum = freq_data.get("adset_cumulative")
+        else:
+            _adset_cum = freq_data.get("account_cumulative", pd.DataFrame()).copy()
+            if _adset_cum is not None and not _adset_cum.empty:
+                _adset_cum[adset_col] = "Selected Ads Aggregate"
+
+        adset_freq = make_rolling_frequency_summary(adset_source, adset_col, cumulative_df=_adset_cum)
         adset_options = adset_freq[adset_col].dropna().astype(str).unique().tolist()
         selected_adset = st.selectbox("Choose ad set", options=sorted(adset_options), key="adset_roll_freq")
 
         selected_adset_df = adset_freq[adset_freq[adset_col].astype(str) == str(selected_adset)].copy()
 
+        _adset_y_cols = [c for c in ["Daily Frequency", "Cumulative Frequency"] if selected_adset_df[c].notna().any()]
+        adset_freq_colors = {"Daily Frequency": "#00D1FF", "Cumulative Frequency": "#FF4D6D"}
         adset_freq_fig = px.line(
             selected_adset_df,
             x="Reporting starts",
-            y=["Daily Frequency", "Weekly Rolling Frequency (7D)", "Monthly Rolling Frequency (30D)"],
+            y=_adset_y_cols,
             markers=True,
-            title=f"Rolling Frequency - {selected_adset}",
+            title=f"Cumulative Frequency - {selected_adset}",
         )
-        adset_freq_colors = {
-            "Daily Frequency": "#00D1FF",
-            "Weekly Rolling Frequency (7D)": "#2E6BFF",
-            "Monthly Rolling Frequency (30D)": "#FF4D6D",
-        }
         adset_freq_fig = apply_metric_colors(adset_freq_fig, adset_freq_colors)
         if overlay_enabled("Adset Rolling Frequency"):
             adset_freq_fig = add_95_confidence_bounds(
                 adset_freq_fig,
                 selected_adset_df,
                 "Reporting starts",
-                ["Daily Frequency", "Weekly Rolling Frequency (7D)", "Monthly Rolling Frequency (30D)"],
+                _adset_y_cols,
                 show_ci=show_ci_bands,
                 show_anomalies=show_anomaly_markers,
                 interval_mode=interval_mode,
@@ -995,30 +1206,27 @@ def main() -> None:
             )
         st.plotly_chart(adset_freq_fig, width="stretch")
 
+        _adset_table_cols = [c for c in [
+            "Reporting starts", "Impressions", "Reach", "Daily Frequency",
+            "Cumulative Reach", "Cumulative Impressions", "Cumulative Frequency",
+        ] if c in selected_adset_df.columns]
         st.dataframe(
-            selected_adset_df[
-                [
-                    "Reporting starts",
-                    "Impressions",
-                    "Reach",
-                    "Daily Frequency",
-                    "Estimated Unique Accounts (7D)",
-                    "Weekly Rolling Frequency (7D)",
-                    "Estimated Unique Accounts (30D)",
-                    "Monthly Rolling Frequency (30D)",
-                ]
-            ].sort_values("Reporting starts", ascending=False),
+            selected_adset_df[_adset_table_cols].sort_values("Reporting starts", ascending=False),
             width="stretch",
             hide_index=True,
         )
 
     with tabs[5]:
-        st.subheader("Individual Ad Daily / Weekly / Monthly Rolling Frequency")
+        st.subheader("Individual Ad Cumulative Frequency")
         st.caption(
-            "Rolling frequency is account-based (impressions divided by estimated deduplicated accounts reached over 7D/30D)."
+            "Cumulative frequency = true deduplicated reach queried from the Meta API "
+            "growing from day 1 of the selected period through each successive day."
         )
 
-        ad_freq = make_rolling_frequency_summary(filtered_df, "Ad name")
+        ad_freq = make_rolling_frequency_summary(
+            filtered_df, "Ad name",
+            cumulative_df=freq_data.get("ad_cumulative"),
+        )
         top_ads = (
             filtered_df.groupby("Ad name", as_index=False)["Amount spent (USD)"]
             .sum()
@@ -1037,89 +1245,93 @@ def main() -> None:
         if selected_ad_names:
             ad_freq_selected = ad_freq[ad_freq["Ad name"].isin(selected_ad_names)].copy()
 
-            ad_roll_fig = px.line(
+            ad_cum_fig = px.line(
                 ad_freq_selected,
                 x="Reporting starts",
-                y="Weekly Rolling Frequency (7D)",
+                y="Cumulative Frequency",
                 color="Ad name",
                 markers=True,
-                title="7D Rolling Frequency by Ad",
+                title="Cumulative Frequency by Ad (day 1 → each day)",
             )
-            st.plotly_chart(ad_roll_fig, width="stretch")
+            st.plotly_chart(ad_cum_fig, width="stretch")
 
-            ad_monthly_roll_fig = px.line(
+            ad_daily_fig = px.line(
                 ad_freq_selected,
                 x="Reporting starts",
-                y="Monthly Rolling Frequency (30D)",
+                y="Daily Frequency",
                 color="Ad name",
                 markers=True,
-                title="30D Rolling Frequency by Ad",
+                title="Daily Frequency by Ad (that day only)",
             )
-            st.plotly_chart(ad_monthly_roll_fig, width="stretch")
+            st.plotly_chart(ad_daily_fig, width="stretch")
 
+            _ad_table_cols = [c for c in [
+                "Reporting starts", "Ad name", "Impressions", "Reach", "Daily Frequency",
+                "Cumulative Reach", "Cumulative Impressions", "Cumulative Frequency",
+            ] if c in ad_freq_selected.columns]
             st.dataframe(
-                ad_freq_selected[
-                    [
-                        "Reporting starts",
-                        "Ad name",
-                        "Impressions",
-                        "Reach",
-                        "Daily Frequency",
-                        "Estimated Unique Accounts (7D)",
-                        "Weekly Rolling Frequency (7D)",
-                        "Estimated Unique Accounts (30D)",
-                        "Monthly Rolling Frequency (30D)",
-                    ]
-                ].sort_values(["Ad name", "Reporting starts"], ascending=[True, False]),
+                ad_freq_selected[_ad_table_cols].sort_values(
+                    ["Ad name", "Reporting starts"], ascending=[True, False]
+                ),
                 width="stretch",
                 hide_index=True,
             )
         else:
-            st.info("Select at least one ad to show rolling frequency.")
+            st.info("Select at least one ad to show cumulative frequency.")
 
     with tabs[6]:
         st.subheader("Frequency Fatigue & New vs Returning Spend")
         st.caption(
-            "Uses accounts-based 30D deduplicated reach (70% overlap assumption) to estimate frequency fatigue and new vs current spend."
+            "Cumulative frequency from the Meta API: each point shows true deduplicated reach "
+            "from campaign-start through that day. Returning impressions = impressions beyond "
+            "first exposure (Cumulative Impressions − Cumulative Reach)."
         )
 
         fatigue_source = filtered_df.copy()
         fatigue_source["Audience Group"] = "Selected Ads"
-        fatigue_roll = make_rolling_frequency_summary(fatigue_source, "Audience Group").sort_values("Reporting starts")
 
-        fatigue_roll["Estimated New Impressions (30D)"] = fatigue_roll["Estimated Unique Accounts (30D)"].clip(
-            upper=fatigue_roll["Rolling Impressions (30D)"]
-        )
-        fatigue_roll["Estimated Returning Impressions (30D)"] = (
-            fatigue_roll["Rolling Impressions (30D)"] - fatigue_roll["Estimated New Impressions (30D)"]
+        _fatigue_cum = freq_data.get("account_cumulative", pd.DataFrame()).copy()
+
+        fatigue_roll = make_rolling_frequency_summary(
+            fatigue_source, "Audience Group",
+            cumulative_df=_fatigue_cum if not _fatigue_cum.empty else None,
+        ).sort_values("Reporting starts")
+
+        # Cumulative new vs returning split
+        fatigue_roll["New Impressions (Cumulative)"] = fatigue_roll["Cumulative Reach"]
+        fatigue_roll["Returning Impressions (Cumulative)"] = (
+            fatigue_roll["Cumulative Impressions"] - fatigue_roll["Cumulative Reach"]
         ).clip(lower=0)
-        fatigue_roll["Estimated New Spend (30D)"] = _safe_divide(
-            fatigue_roll["Estimated New Impressions (30D)"], fatigue_roll["Rolling Impressions (30D)"]
-        ) * fatigue_roll["Rolling Spend (30D)"]
-        fatigue_roll["Estimated Returning Spend (30D)"] = _safe_divide(
-            fatigue_roll["Estimated Returning Impressions (30D)"], fatigue_roll["Rolling Impressions (30D)"]
-        ) * fatigue_roll["Rolling Spend (30D)"]
-        fatigue_roll["Fatigue Index (30D)"] = (
-            (fatigue_roll["Monthly Rolling Frequency (30D)"].fillna(0) - 1).clip(lower=0)
-            * _safe_divide(fatigue_roll["Rolling Spend (30D)"], fatigue_roll["Estimated Unique Accounts (30D)"])
+        fatigue_roll["New Spend (Cumulative)"] = _safe_divide(
+            fatigue_roll["New Impressions (Cumulative)"], fatigue_roll["Cumulative Impressions"]
+        ) * fatigue_roll["Cumulative Spend"]
+        fatigue_roll["Returning Spend (Cumulative)"] = _safe_divide(
+            fatigue_roll["Returning Impressions (Cumulative)"], fatigue_roll["Cumulative Impressions"]
+        ) * fatigue_roll["Cumulative Spend"]
+        fatigue_roll["Fatigue Index"] = (
+            (fatigue_roll["Cumulative Frequency"].fillna(0) - 1).clip(lower=0)
+            * _safe_divide(fatigue_roll["Cumulative Spend"], fatigue_roll["Cumulative Reach"])
         )
 
-        latest_30d = fatigue_roll.tail(1).iloc[0]
+        latest_row = fatigue_roll.dropna(subset=["Cumulative Frequency"]).tail(1)
+        if latest_row.empty:
+            latest_row = fatigue_roll.tail(1)
+        latest_cum = latest_row.iloc[0]
 
-        total_new_spend = float(latest_30d["Estimated New Spend (30D)"])
-        total_returning_spend = float(latest_30d["Estimated Returning Spend (30D)"])
-        total_spend = float(latest_30d["Rolling Spend (30D)"])
+        total_new_spend = float(latest_cum.get("New Spend (Cumulative)") or 0)
+        total_returning_spend = float(latest_cum.get("Returning Spend (Cumulative)") or 0)
+        total_spend = float(latest_cum.get("Cumulative Spend") or 0)
 
         fatigue_col1, fatigue_col2, fatigue_col3, fatigue_col4 = st.columns(4)
-        fatigue_col1.metric("New People Spend (30D)", f"${total_new_spend:,.2f}")
-        fatigue_col2.metric("Current People Spend (30D)", f"${total_returning_spend:,.2f}")
+        fatigue_col1.metric("New People Spend (Cumulative)", f"${total_new_spend:,.2f}")
+        fatigue_col2.metric("Returning People Spend (Cumulative)", f"${total_returning_spend:,.2f}")
         fatigue_col3.metric(
-            "Current People Spend %",
+            "Returning People Spend %",
             "-" if total_spend <= 0 else f"{(total_returning_spend / total_spend) * 100:,.1f}%",
         )
         fatigue_col4.metric(
-            "30D Rolling Frequency",
-            "-" if pd.isna(latest_30d["Monthly Rolling Frequency (30D)"]) else f"{latest_30d['Monthly Rolling Frequency (30D)']:,.2f}",
+            "Cumulative Frequency",
+            "-" if pd.isna(latest_cum.get("Cumulative Frequency")) else f"{latest_cum['Cumulative Frequency']:,.2f}",
         )
 
         trend_col1, trend_col2 = st.columns(2)
@@ -1127,15 +1339,15 @@ def main() -> None:
         with trend_col1:
             fatigue_freq_colors = {
                 "Daily Frequency": "#00D1FF",
-                "Weekly Rolling Frequency (7D)": "#2E6BFF",
-                "Monthly Rolling Frequency (30D)": "#FF4D6D",
+                "Cumulative Frequency": "#FF4D6D",
             }
+            _fatigue_y = [c for c in ["Daily Frequency", "Cumulative Frequency"] if fatigue_roll[c].notna().any()]
             fatigue_trend = px.line(
                 fatigue_roll,
                 x="Reporting starts",
-                y=["Daily Frequency", "Weekly Rolling Frequency (7D)", "Monthly Rolling Frequency (30D)"],
+                y=_fatigue_y,
                 markers=True,
-                title="Frequency Trend (Daily vs 7D vs 30D)",
+                title="Frequency Trend (Daily vs Cumulative)",
             )
             fatigue_trend = apply_metric_colors(fatigue_trend, fatigue_freq_colors)
             if overlay_enabled("Frequency Trend (Fatigue)"):
@@ -1143,7 +1355,7 @@ def main() -> None:
                     fatigue_trend,
                     fatigue_roll,
                     "Reporting starts",
-                    ["Daily Frequency", "Weekly Rolling Frequency (7D)", "Monthly Rolling Frequency (30D)"],
+                    _fatigue_y,
                     show_ci=show_ci_bands,
                     show_anomalies=show_anomaly_markers,
                     interval_mode=interval_mode,
@@ -1152,36 +1364,39 @@ def main() -> None:
             st.plotly_chart(fatigue_trend, width="stretch")
 
         with trend_col2:
-            spend_split_trend = px.area(
+            _spend_split_cols = [c for c in ["New Spend (Cumulative)", "Returning Spend (Cumulative)"] if fatigue_roll[c].notna().any()]
+            if _spend_split_cols:
+                spend_split_trend = px.area(
+                    fatigue_roll,
+                    x="Reporting starts",
+                    y=_spend_split_cols,
+                    title="Cumulative Spend Split: New vs Returning People",
+                )
+                st.plotly_chart(spend_split_trend, width="stretch")
+
+        if fatigue_roll["Fatigue Index"].notna().any():
+            fatigue_index_fig = px.line(
                 fatigue_roll,
                 x="Reporting starts",
-                y=["Estimated New Spend (30D)", "Estimated Returning Spend (30D)"],
-                title="30D Spend Split: New vs Current People",
+                y="Fatigue Index",
+                markers=True,
+                title="Fatigue Index Trend (Cumulative)",
             )
-            st.plotly_chart(spend_split_trend, width="stretch")
-
-        fatigue_index_fig = px.line(
-            fatigue_roll,
-            x="Reporting starts",
-            y="Fatigue Index (30D)",
-            markers=True,
-            title="30D Fatigue Index Trend",
-        )
-        if overlay_enabled("Fatigue Index (30D)"):
-            fatigue_index_fig = add_95_confidence_bounds(
-                fatigue_index_fig,
-                fatigue_roll,
-                "Reporting starts",
-                "Fatigue Index (30D)",
-                show_ci=show_ci_bands,
-                show_anomalies=show_anomaly_markers,
-                interval_mode=interval_mode,
-            )
-        st.plotly_chart(fatigue_index_fig, width="stretch")
+            if overlay_enabled("Fatigue Index (30D)"):
+                fatigue_index_fig = add_95_confidence_bounds(
+                    fatigue_index_fig,
+                    fatigue_roll,
+                    "Reporting starts",
+                    "Fatigue Index",
+                    show_ci=show_ci_bands,
+                    show_anomalies=show_anomaly_markers,
+                    interval_mode=interval_mode,
+                )
+            st.plotly_chart(fatigue_index_fig, width="stretch")
 
         split_totals = pd.DataFrame(
             {
-                "Audience Type": ["New People (30D)", "Current People (30D)"],
+                "Audience Type": ["New People (Cumulative)", "Returning People (Cumulative)"],
                 "Estimated Spend": [total_new_spend, total_returning_spend],
             }
         )
@@ -1193,58 +1408,56 @@ def main() -> None:
         )
         st.plotly_chart(split_pie, width="stretch")
 
-        ad_roll = make_rolling_frequency_summary(filtered_df, "Ad name").sort_values("Reporting starts")
+        ad_roll = make_rolling_frequency_summary(
+            filtered_df, "Ad name",
+            cumulative_df=freq_data.get("ad_cumulative"),
+        ).sort_values("Reporting starts")
         latest_ad_roll = ad_roll.groupby("Ad name", as_index=False).tail(1).copy()
 
-        latest_ad_roll["Estimated New Impressions (30D)"] = latest_ad_roll["Estimated Unique Accounts (30D)"].clip(
-            upper=latest_ad_roll["Rolling Impressions (30D)"]
-        )
-        latest_ad_roll["Estimated Returning Impressions (30D)"] = (
-            latest_ad_roll["Rolling Impressions (30D)"] - latest_ad_roll["Estimated New Impressions (30D)"]
+        latest_ad_roll["New Impressions (Cumulative)"] = latest_ad_roll["Cumulative Reach"]
+        latest_ad_roll["Returning Impressions (Cumulative)"] = (
+            latest_ad_roll["Cumulative Impressions"] - latest_ad_roll["Cumulative Reach"]
         ).clip(lower=0)
-        latest_ad_roll["Estimated New Spend (30D)"] = _safe_divide(
-            latest_ad_roll["Estimated New Impressions (30D)"], latest_ad_roll["Rolling Impressions (30D)"]
-        ) * latest_ad_roll["Rolling Spend (30D)"]
-        latest_ad_roll["Estimated Current Spend (30D)"] = _safe_divide(
-            latest_ad_roll["Estimated Returning Impressions (30D)"], latest_ad_roll["Rolling Impressions (30D)"]
-        ) * latest_ad_roll["Rolling Spend (30D)"]
-        latest_ad_roll["Fatigue Index (30D)"] = (
-            (latest_ad_roll["Monthly Rolling Frequency (30D)"].fillna(0) - 1).clip(lower=0)
-            * _safe_divide(latest_ad_roll["Rolling Spend (30D)"], latest_ad_roll["Estimated Unique Accounts (30D)"])
+        latest_ad_roll["New Spend (Cumulative)"] = _safe_divide(
+            latest_ad_roll["New Impressions (Cumulative)"], latest_ad_roll["Cumulative Impressions"]
+        ) * latest_ad_roll["Cumulative Spend"]
+        latest_ad_roll["Returning Spend (Cumulative)"] = _safe_divide(
+            latest_ad_roll["Returning Impressions (Cumulative)"], latest_ad_roll["Cumulative Impressions"]
+        ) * latest_ad_roll["Cumulative Spend"]
+        latest_ad_roll["Fatigue Index"] = (
+            (latest_ad_roll["Cumulative Frequency"].fillna(0) - 1).clip(lower=0)
+            * _safe_divide(latest_ad_roll["Cumulative Spend"], latest_ad_roll["Cumulative Reach"])
         )
 
         fatigue_ads = ad_summary.merge(
             latest_ad_roll[
-                [
+                [c for c in [
                     "Ad name",
-                    "Weekly Rolling Frequency (7D)",
-                    "Monthly Rolling Frequency (30D)",
-                    "Estimated New Spend (30D)",
-                    "Estimated Current Spend (30D)",
-                    "Fatigue Index (30D)",
-                ]
+                    "Cumulative Frequency",
+                    "New Spend (Cumulative)",
+                    "Returning Spend (Cumulative)",
+                    "Fatigue Index",
+                ] if c in latest_ad_roll.columns]
             ],
             on="Ad name",
             how="left",
-        ).sort_values("Fatigue Index (30D)", ascending=False)
+        ).sort_values("Fatigue Index", ascending=False)
         st.subheader("Ad Fatigue Table")
+        _fatigue_table_cols = [c for c in [
+            "Ad name",
+            "Ad delivery",
+            "Amount spent (USD)",
+            "Cumulative Frequency",
+            "Reach",
+            "Impressions",
+            "New Spend (Cumulative)",
+            "Returning Spend (Cumulative)",
+            "Fatigue Index",
+            "Results per $100",
+            "Cost per Result",
+        ] if c in fatigue_ads.columns]
         st.dataframe(
-            fatigue_ads[
-                [
-                    "Ad name",
-                    "Ad delivery",
-                    "Amount spent (USD)",
-                    "Weekly Rolling Frequency (7D)",
-                    "Monthly Rolling Frequency (30D)",
-                    "Reach",
-                    "Impressions",
-                    "Estimated New Spend (30D)",
-                    "Estimated Current Spend (30D)",
-                    "Fatigue Index (30D)",
-                    "Results per $100",
-                    "Cost per Result",
-                ]
-            ],
+            fatigue_ads[_fatigue_table_cols],
             width="stretch",
             hide_index=True,
         )
@@ -1279,8 +1492,12 @@ def main() -> None:
             "Analyze the relationship between frequency and attribution types (click vs view-based conversions) to identify frequency ceilings and scaling bottlenecks."
         )
 
-        attr_health_daily, attr_daily_detail = make_attribution_health_summary(filtered_df)
-        ad_attr_summary = make_attribution_ad_summary(filtered_df)
+        attr_health_daily, attr_daily_detail = make_attribution_health_summary(
+            filtered_df, account_daily_df=freq_data.get("account_daily")
+        )
+        ad_attr_summary = make_attribution_ad_summary(
+            filtered_df, ad_alldays_df=freq_data.get("ad_alldays")
+        )
 
         if attr_health_daily is None:
             st.warning("Attribution setting data not available in this dataset.")
