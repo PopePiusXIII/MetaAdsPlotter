@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import math
 import os
 import pickle
 from pathlib import Path
@@ -106,7 +107,7 @@ def fetch_from_api(
         "time_increment": 1,   # one row per day per ad
         "level": "ad",
         "limit": 500,
-        "action_attribution_windows": ["7d_click", "1d_view"],
+        "action_attribution_windows": ["7d_click", "1d_click", "1d_view"],
     }
 
     try:
@@ -163,6 +164,7 @@ def fetch_from_api(
         landing_page_views = _get_action(actions_list, "landing_page_view")
         purchases = _get_action(actions_list, "offsite_conversion.fb_pixel_purchase")
         purchases_7d_click = _get_action_window(actions_list, "offsite_conversion.fb_pixel_purchase", "7d_click")
+        purchases_1d_click = _get_action_window(actions_list, "offsite_conversion.fb_pixel_purchase", "1d_click")
         purchases_1d_view = _get_action_window(actions_list, "offsite_conversion.fb_pixel_purchase", "1d_view")
         video_3s = (float(video_plays[0]["value"]) if video_plays else None)
         thruplays = (float(video_thru[0]["value"]) if video_thru else None)
@@ -206,6 +208,7 @@ def fetch_from_api(
             "Photo clicks": _get_action(actions_list, "photo_view"),
             "Purchases": purchases,
             "Results (7d_click)": purchases_7d_click,
+            "Results (1d_click)": purchases_1d_click,
             "Results (1d_view)": purchases_1d_view,
             "Purchase ROAS (return on ad spend)": roas_value,
             "Results": purchases,
@@ -718,7 +721,7 @@ def make_attribution_health_summary(filtered_df: pd.DataFrame, account_daily_df:
         "Results": "sum",
         "Amount spent (USD)": "sum",
     }
-    for _w_col in ["Results (7d_click)", "Results (1d_view)"]:
+    for _w_col in ["Results (7d_click)", "Results (1d_click)", "Results (1d_view)"]:
         if _w_col in filtered_df.columns:
             _agg_map[_w_col] = "sum"
     daily_agg = (
@@ -862,64 +865,97 @@ def main() -> None:
 
     # ── Data loading ──────────────────────────────────────────────────────────
     if data_source == "Cache":
-        if not load_cache_btn:
+        _cache_key = str(selected_cache_path) if selected_cache_path else ""
+        _cache_already_loaded = (
+            "loaded_df" in st.session_state
+            and st.session_state.get("loaded_source_key") == _cache_key
+        )
+        if load_cache_btn:
+            # Explicit reload requested — re-read from disk
+            if selected_cache_path is None or not selected_cache_path.exists():
+                st.error("Cache file not found.")
+                st.stop()
+            with st.spinner(f"Loading cache: {selected_cache_path.name}…"):
+                cached = _load_cache(selected_cache_path)
+            _df = cached["df"]
+            # Patch caches saved before Results was corrected to purchases
+            if "Purchases" in _df.columns:
+                _df["Results"] = _df["Purchases"]
+            # Patch caches saved before attribution window columns existed
+            if "Results (7d_click)" not in _df.columns:
+                _df["Results (7d_click)"] = None
+            if "Results (1d_click)" not in _df.columns:
+                _df["Results (1d_click)"] = None
+            if "Results (1d_view)" not in _df.columns:
+                _df["Results (1d_view)"] = None
+            st.session_state["loaded_df"] = _df
+            st.session_state["loaded_freq_data"] = cached["freq_data"]
+            st.session_state["loaded_source_key"] = _cache_key
+            st.session_state["loaded_src_label"] = (
+                f"Cache: {selected_cache_path.name}  |  "
+                f"{cached.get('date_start')} → {cached.get('date_stop')}  |  "
+                f"Account {cached.get('account_id')}"
+            )
+        elif not _cache_already_loaded:
+            # No data in session yet and button not clicked — prompt user
             st.info("Select a cache file and click **Load Cache**.")
             st.stop()
-        if selected_cache_path is None or not selected_cache_path.exists():
-            st.error("Cache file not found.")
-            st.stop()
-        with st.spinner(f"Loading cache: {selected_cache_path.name}…"):
-            cached = _load_cache(selected_cache_path)
-        df = cached["df"]
-        # Patch caches saved before Results was corrected to purchases
-        if "Purchases" in df.columns:
-            df["Results"] = df["Purchases"]
-        # Patch caches saved before attribution window columns existed
-        if "Results (7d_click)" not in df.columns:
-            df["Results (7d_click)"] = None
-        if "Results (1d_view)" not in df.columns:
-            df["Results (1d_view)"] = None
-        freq_data = cached["freq_data"]
-        _src_label = (
-            f"Cache: {selected_cache_path.name}  |  "
-            f"{cached.get('date_start')} → {cached.get('date_stop')}  |  "
-            f"Account {cached.get('account_id')}"
-        )
+        # Data is in session_state — use it directly (handles all widget re-runs)
+        df = st.session_state["loaded_df"]
+        freq_data = st.session_state["loaded_freq_data"]
+        _src_label = st.session_state["loaded_src_label"]
     else:
-        if not (api_date_start and api_date_stop):
-            st.info("Pick a date range in the sidebar and click **Fetch from API**.")
-            st.stop()
-        if not fetch_api:
-            st.info("Click **Fetch from API** in the sidebar to load data.")
-            st.stop()
-        with st.spinner("Fetching ad insights from Meta API…"):
-            df = fetch_from_api(
-                access_token=api_token,
-                ad_account_id=api_account_id,
+        _api_key = f"{api_account_id}_{api_date_start}_{api_date_stop}"
+        _api_already_loaded = (
+            "loaded_df" in st.session_state
+            and st.session_state.get("loaded_source_key") == _api_key
+        )
+        if fetch_api:
+            # Explicit fetch requested
+            if not (api_date_start and api_date_stop):
+                st.info("Pick a date range in the sidebar and click **Fetch from API**.")
+                st.stop()
+            with st.spinner("Fetching ad insights from Meta API…"):
+                _df = fetch_from_api(
+                    access_token=api_token,
+                    ad_account_id=api_account_id,
+                    date_start=api_date_start.strftime("%Y-%m-%d"),
+                    date_stop=api_date_stop.strftime("%Y-%m-%d"),
+                )
+            if _df.empty:
+                st.stop()
+            with st.spinner("Fetching reach & frequency breakdowns from Meta API…"):
+                _freq_data = fetch_frequency_breakdowns(
+                    access_token=api_token,
+                    ad_account_id=api_account_id,
+                    date_start=api_date_start.strftime("%Y-%m-%d"),
+                    date_stop=api_date_stop.strftime("%Y-%m-%d"),
+                )
+            cache_path = _save_cache(
+                _df, _freq_data,
+                account_id=api_account_id,
                 date_start=api_date_start.strftime("%Y-%m-%d"),
                 date_stop=api_date_stop.strftime("%Y-%m-%d"),
             )
-        if df.empty:
-            st.stop()
-        with st.spinner("Fetching reach & frequency breakdowns from Meta API…"):
-            freq_data = fetch_frequency_breakdowns(
-                access_token=api_token,
-                ad_account_id=api_account_id,
-                date_start=api_date_start.strftime("%Y-%m-%d"),
-                date_stop=api_date_stop.strftime("%Y-%m-%d"),
+            st.sidebar.success(f"Saved to cache: {cache_path.name}")
+            st.session_state["loaded_df"] = _df
+            st.session_state["loaded_freq_data"] = _freq_data
+            st.session_state["loaded_source_key"] = _api_key
+            st.session_state["loaded_src_label"] = (
+                f"Data source: Meta Marketing API  |  "
+                f"{api_date_start} → {api_date_stop}  |  "
+                f"Account {api_account_id}"
             )
-        cache_path = _save_cache(
-            df, freq_data,
-            account_id=api_account_id,
-            date_start=api_date_start.strftime("%Y-%m-%d"),
-            date_stop=api_date_stop.strftime("%Y-%m-%d"),
-        )
-        st.sidebar.success(f"Saved to cache: {cache_path.name}")
-        _src_label = (
-            f"Data source: Meta Marketing API  |  "
-            f"{api_date_start} → {api_date_stop}  |  "
-            f"Account {api_account_id}"
-        )
+        elif not _api_already_loaded:
+            if not (api_date_start and api_date_stop):
+                st.info("Pick a date range in the sidebar and click **Fetch from API**.")
+            else:
+                st.info("Click **Fetch from API** in the sidebar to load data.")
+            st.stop()
+        # Data is in session_state — use it directly (handles all widget re-runs)
+        df = st.session_state["loaded_df"]
+        freq_data = st.session_state["loaded_freq_data"]
+        _src_label = st.session_state["loaded_src_label"]
 
     if df.empty:
         st.stop()
@@ -1019,6 +1055,7 @@ def main() -> None:
             "Scaling & Attribution Health",
             "CPM Trends",
             "Video Deep Dive",
+            "Audience Overlap",
         ]
     )
 
@@ -1658,9 +1695,9 @@ def main() -> None:
                     fig_attr.add_trace(go.Bar(
                         x=pivot_results.index,
                         y=pivot_results[click_col],
-                        name="7-Day Click Sales",
+                        name="1-Day Click Sales",
                         yaxis="y1",
-                        marker_color="#FF8C00",
+                        marker_color="#22C55E",
                     ))
                 if view_col:
                     fig_attr.add_trace(go.Bar(
@@ -1670,13 +1707,27 @@ def main() -> None:
                         yaxis="y1",
                         marker_color="#1A6FD4",
                     ))
+                _attr_roll_std = roas_daily["Results per $100"].rolling(14, min_periods=1).std().fillna(0)
+                _attr_ci_upper = roas_daily["Results per $100"] + _attr_roll_std
+                _attr_ci_lower = (roas_daily["Results per $100"] - _attr_roll_std).clip(lower=0)
+                fig_attr.add_trace(go.Scatter(
+                    x=pd.concat([roas_daily["Reporting starts"], roas_daily["Reporting starts"].iloc[::-1]]),
+                    y=pd.concat([_attr_ci_upper, _attr_ci_lower.iloc[::-1]]),
+                    fill="toself",
+                    fillcolor="rgba(26, 111, 212, 0.2)",
+                    line=dict(color="rgba(255,255,255,0)"),
+                    name="Confidence Interval",
+                    yaxis="y2",
+                    showlegend=True,
+                    hoverinfo="skip",
+                ))
                 fig_attr.add_trace(go.Scatter(
                     x=roas_daily["Reporting starts"],
                     y=roas_daily["Results per $100"],
                     name="Results per $100",
                     yaxis="y2",
                     mode="lines+markers",
-                    line=dict(color="#FF4D6D", width=3),
+                    line=dict(color="#1A6FD4", width=3),
                 ))
                 fig_attr.update_layout(
                     title="Where Does Click ROAS Drop? (7-Day Click vs 1-Day View Sales)",
@@ -1697,14 +1748,44 @@ def main() -> None:
                     _safe_divide(roas_daily["Results"] * 100, roas_daily["Amount spent (USD)"]),
                     errors="coerce",
                 )
+                has_1d_click_split = (
+                    has_window_split
+                    and "Results (1d_click)" in roas_daily.columns
+                    and (pd.to_numeric(roas_daily["Results (1d_click)"], errors="coerce") > 0).any()
+                )
                 fig_roas = go.Figure()
-                if has_window_split:
+                if has_1d_click_split:
+                    _7d = pd.to_numeric(roas_daily["Results (7d_click)"], errors="coerce").fillna(0)
+                    _1d_c = pd.to_numeric(roas_daily["Results (1d_click)"], errors="coerce").fillna(0)
+                    _2_7d = (_7d - _1d_c).clip(lower=0)
+                    fig_roas.add_trace(go.Bar(
+                        x=roas_daily["Reporting starts"],
+                        y=_2_7d,
+                        name="2-7 Day Click Sales",
+                        yaxis="y1",
+                        marker_color="#FF8C00",
+                    ))
+                    fig_roas.add_trace(go.Bar(
+                        x=roas_daily["Reporting starts"],
+                        y=_1d_c,
+                        name="1-Day Click Sales",
+                        yaxis="y1",
+                        marker_color="#22C55E",
+                    ))
+                    fig_roas.add_trace(go.Bar(
+                        x=roas_daily["Reporting starts"],
+                        y=pd.to_numeric(roas_daily["Results (1d_view)"], errors="coerce"),
+                        name="1-Day View Sales",
+                        yaxis="y1",
+                        marker_color="#1A6FD4",
+                    ))
+                elif has_window_split:
                     fig_roas.add_trace(go.Bar(
                         x=roas_daily["Reporting starts"],
                         y=pd.to_numeric(roas_daily["Results (7d_click)"], errors="coerce"),
                         name="7-Day Click Sales",
                         yaxis="y1",
-                        marker_color="#FF8C00",
+                        marker_color="#22C55E",
                     ))
                     fig_roas.add_trace(go.Bar(
                         x=roas_daily["Reporting starts"],
@@ -1721,13 +1802,27 @@ def main() -> None:
                         yaxis="y1",
                         marker_color="#FF8C00",
                     ))
+                _roas_roll_std = roas_daily["Results per $100"].rolling(14, min_periods=1).std().fillna(0)
+                _roas_ci_upper = roas_daily["Results per $100"] + _roas_roll_std
+                _roas_ci_lower = (roas_daily["Results per $100"] - _roas_roll_std).clip(lower=0)
+                fig_roas.add_trace(go.Scatter(
+                    x=pd.concat([roas_daily["Reporting starts"], roas_daily["Reporting starts"].iloc[::-1]]),
+                    y=pd.concat([_roas_ci_upper, _roas_ci_lower.iloc[::-1]]),
+                    fill="toself",
+                    fillcolor="rgba(26, 111, 212, 0.2)",
+                    line=dict(color="rgba(255,255,255,0)"),
+                    name="Confidence Interval",
+                    yaxis="y2",
+                    showlegend=True,
+                    hoverinfo="skip",
+                ))
                 fig_roas.add_trace(go.Scatter(
                     x=roas_daily["Reporting starts"],
                     y=roas_daily["Results per $100"],
                     name="Results per $100",
                     yaxis="y2",
                     mode="lines+markers",
-                    line=dict(color="#FF4D6D", width=3),
+                    line=dict(color="#1A6FD4", width=3),
                 ))
                 fig_roas.update_layout(
                     title="Where Does Click ROAS Drop? (7-Day Click vs 1-Day View Sales)",
@@ -2082,6 +2177,326 @@ def main() -> None:
                     vid_ad[score_cols].sort_values("Video Score", ascending=False),
                     width="stretch", hide_index=True
                 )
+
+    # ── Tab 10: Audience Overlap ───────────────────────────────────────────────
+    with tabs[10]:
+        st.subheader("Audience Overlap Estimator")
+        st.caption(
+            "Estimates how many people two or more ad sets share. "
+            "Because Meta does not expose direct intersection data, overlap is estimated as "
+            "**max(inclusion-exclusion lower bound, probabilistic random-targeting model)**. "
+            "Treat numbers as directional, not exact."
+        )
+
+        _adset_cum = freq_data.get("adset_cumulative")
+        _acct_cum  = freq_data.get("account_cumulative")
+
+        if _adset_cum is None or _adset_cum.empty:
+            st.info("No adset-level cumulative data found in this cache. Re-fetch from the API to generate it.")
+        else:
+            # Use the latest date snapshot for each adset (maximum cumulative reach)
+            _latest_adset = (
+                _adset_cum.sort_values("date_stop")
+                .groupby("Ad set name", as_index=False)
+                .last()
+            )
+            # Account total reach at the latest overall date
+            _total_reach = 0.0
+            if _acct_cum is not None and not _acct_cum.empty:
+                _total_reach = float(_acct_cum.sort_values("date_stop").iloc[-1].get("reach", 0) or 0)
+            if _total_reach <= 0:
+                # Fall back: sum of all adset reaches (upper bound)
+                _total_reach = float(_latest_adset["reach"].sum())
+
+            all_adset_names = sorted(_latest_adset["Ad set name"].dropna().astype(str).unique().tolist())
+
+            selected_overlap_adsets = st.multiselect(
+                "Select ad sets to compare (2–5 recommended)",
+                options=all_adset_names,
+                default=all_adset_names[:2] if len(all_adset_names) >= 2 else all_adset_names,
+                key="overlap_adset_select",
+            )
+
+            if len(selected_overlap_adsets) < 2:
+                st.info("Select at least 2 ad sets to see overlap.")
+            else:
+                # Build reach lookup
+                reach_map: dict[str, float] = {}
+                for name in selected_overlap_adsets:
+                    row = _latest_adset[_latest_adset["Ad set name"].astype(str) == name]
+                    reach_map[name] = float(row["reach"].iloc[0]) if not row.empty else 0.0
+
+                names_sel  = selected_overlap_adsets
+                reaches_sel = [reach_map[n] for n in names_sel]
+
+                # Compute all pairwise overlaps
+                pw: dict[tuple[int, int], float] = {}
+                for i in range(len(names_sel)):
+                    for j in range(i + 1, len(names_sel)):
+                        pw[(i, j)] = _estimate_overlap(reaches_sel[i], reaches_sel[j], _total_reach)
+
+                # ── Reach bar chart (always shown) ────────────────────────────
+                bar_df = pd.DataFrame({"Ad Set": names_sel, "Cumulative Reach": reaches_sel})
+                bar_fig = px.bar(
+                    bar_df,
+                    x="Ad Set", y="Cumulative Reach",
+                    color="Ad Set",
+                    title="Total Cumulative Reach per Ad Set",
+                    color_discrete_sequence=px.colors.qualitative.Bold,
+                )
+                bar_fig.update_layout(
+                    showlegend=False,
+                    plot_bgcolor="#1a1a2e", paper_bgcolor="#1a1a2e",
+                    font=dict(color="white"),
+                    xaxis=dict(tickangle=-30),
+                )
+                st.plotly_chart(bar_fig, use_container_width=True)
+
+                # ── Venn or heatmap ───────────────────────────────────────────
+                if len(names_sel) == 2:
+                    venn_fig = _build_venn2_figure(
+                        names_sel[0], reaches_sel[0],
+                        names_sel[1], reaches_sel[1],
+                        pw[(0, 1)],
+                    )
+                    st.plotly_chart(venn_fig, use_container_width=False)
+
+                elif len(names_sel) == 3:
+                    venn_fig = _build_venn3_figure(names_sel, reaches_sel, pw)
+                    st.plotly_chart(venn_fig, use_container_width=False)
+
+                else:
+                    # Pairwise heatmap for 4+ adsets
+                    n = len(names_sel)
+                    matrix = [[0.0] * n for _ in range(n)]
+                    for i in range(n):
+                        matrix[i][i] = reaches_sel[i]
+                        for j in range(i + 1, n):
+                            v = pw[(i, j)]
+                            matrix[i][j] = v
+                            matrix[j][i] = v
+                    heat_fig = go.Figure(go.Heatmap(
+                        z=matrix,
+                        x=[n[:22] for n in names_sel],
+                        y=[n[:22] for n in names_sel],
+                        colorscale="Blues",
+                        text=[[f"{v:,.0f}" for v in row] for row in matrix],
+                        texttemplate="%{text}",
+                        hoverongaps=False,
+                        colorbar=dict(title="Reach / Overlap"),
+                    ))
+                    heat_fig.update_layout(
+                        title="Pairwise Audience Overlap Matrix",
+                        plot_bgcolor="#1a1a2e", paper_bgcolor="#1a1a2e",
+                        font=dict(color="white"),
+                        height=500,
+                        xaxis=dict(tickangle=-30),
+                    )
+                    st.plotly_chart(heat_fig, use_container_width=True)
+
+                # ── Summary stats table ───────────────────────────────────────
+                st.subheader("Overlap Summary")
+                summary_rows = []
+                for i in range(len(names_sel)):
+                    for j in range(i + 1, len(names_sel)):
+                        ov   = pw[(i, j)]
+                        ra_  = reaches_sel[i]
+                        rb_  = reaches_sel[j]
+                        jaccard = ov / (ra_ + rb_ - ov) if (ra_ + rb_ - ov) > 0 else 0.0
+                        summary_rows.append({
+                            "Ad Set A": names_sel[i],
+                            "Ad Set B": names_sel[j],
+                            "Reach A":  int(ra_),
+                            "Reach B":  int(rb_),
+                            "Est. Shared": int(ov),
+                            "% of A": f"{100 * ov / ra_:.1f}%" if ra_ > 0 else "—",
+                            "% of B": f"{100 * ov / rb_:.1f}%" if rb_ > 0 else "—",
+                            "Jaccard Index": f"{jaccard:.3f}",
+                        })
+                if summary_rows:
+                    st.dataframe(pd.DataFrame(summary_rows), width="stretch", hide_index=True)
+
+                st.caption(
+                    f"Account total reach used as universe: **{_total_reach:,.0f}**. "
+                    "Diagonal of the matrix = each ad set's own reach."
+                )
+
+
+# ── Audience-overlap helpers ──────────────────────────────────────────────────
+
+def _estimate_overlap(reach_a: float, reach_b: float, total_reach: float) -> float:
+    """Estimate the shared audience between two adsets.
+
+    Uses the maximum of:
+    - Probabilistic (random-targeting) model: A * B / total
+    - Inclusion-exclusion lower bound: max(0, A + B - total)
+    """
+    if total_reach <= 0:
+        return 0.0
+    prob_est   = reach_a * reach_b / total_reach
+    lower_bound = max(0.0, reach_a + reach_b - total_reach)
+    return float(max(lower_bound, prob_est))
+
+
+def _build_venn2_figure(
+    name_a: str, reach_a: float,
+    name_b: str, reach_b: float,
+    overlap: float,
+) -> go.Figure:
+    """Render a two-circle Venn diagram using Plotly shapes."""
+    overlap = float(max(0.0, min(overlap, min(reach_a, reach_b))))
+    a_only  = reach_a - overlap
+    b_only  = reach_b - overlap
+
+    max_r = max(reach_a, reach_b, 1)
+    scale = 0.27
+    R_A = scale * math.sqrt(reach_a / max_r)
+    R_B = scale * math.sqrt(reach_b / max_r)
+
+    sep  = (R_A + R_B) * 0.65   # visual overlap ~35 %
+    cx_a = 0.5 - sep / 2
+    cx_b = 0.5 + sep / 2
+    cy   = 0.5
+
+    FILLS = ["rgba(0,209,255,0.30)",  "rgba(255,77,109,0.30)"]
+    LINES = ["rgba(0,209,255,0.90)",  "rgba(255,77,109,0.90)"]
+
+    fig = go.Figure()
+    for idx, (cx, R) in enumerate([(cx_a, R_A), (cx_b, R_B)]):
+        fig.add_shape(
+            type="circle",
+            x0=cx - R, y0=cy - R, x1=cx + R, y1=cy + R,
+            fillcolor=FILLS[idx], line_color=LINES[idx], line_width=2,
+            layer="below",
+        )
+
+    for idx, (lx, lname, lval) in enumerate([
+        (cx_a - R_A * 0.58, name_a, a_only),
+        (cx_b + R_B * 0.58, name_b, b_only),
+    ]):
+        fig.add_annotation(
+            x=lx, y=cy,
+            text=(
+                f"<b>{lname[:24]}</b><br>"
+                f"<span style='font-size:16px'><b>{lval:,.0f}</b></span><br>"
+                "unique reach"
+            ),
+            showarrow=False, font=dict(size=11, color="white"), align="center",
+        )
+
+    fig.add_annotation(
+        x=(cx_a + cx_b) / 2, y=cy,
+        text=f"<b>~{overlap:,.0f}</b><br>shared",
+        showarrow=False, font=dict(size=13, color="white"), align="center",
+    )
+
+    fig.update_layout(
+        xaxis=dict(visible=False, range=[0, 1]),
+        yaxis=dict(visible=False, range=[0.05, 0.95], scaleanchor="x"),
+        plot_bgcolor="#1a1a2e", paper_bgcolor="#1a1a2e",
+        height=440,
+        margin=dict(l=10, r=10, t=55, b=10),
+        title=dict(
+            text=f"Estimated Audience Overlap — {name_a[:20]} ↔ {name_b[:20]}",
+            font=dict(color="white", size=14),
+        ),
+    )
+    return fig
+
+
+def _build_venn3_figure(
+    names: list[str],
+    reaches: list[float],
+    pw_overlaps: dict[tuple[int, int], float],
+) -> go.Figure:
+    """Three-circle Venn with equilateral-triangle layout."""
+    ra, rb, rc = [float(r) for r in reaches]
+    ab = pw_overlaps.get((0, 1), 0.0)
+    ac = pw_overlaps.get((0, 2), 0.0)
+    bc = pw_overlaps.get((1, 2), 0.0)
+    abc = min(ab, ac, bc) * 0.4   # rough 3-way estimate
+
+    # Region sizes
+    a_only  = max(0, ra - ab - ac + abc)
+    b_only  = max(0, rb - ab - bc + abc)
+    c_only  = max(0, rc - ac - bc + abc)
+    ab_only = max(0, ab - abc)
+    ac_only = max(0, ac - abc)
+    bc_only = max(0, bc - abc)
+
+    # Equilateral triangle centres
+    max_r = max(ra, rb, rc, 1)
+    scale = 0.22
+    Rs    = [scale * math.sqrt(r / max_r) for r in [ra, rb, rc]]
+    # top, bottom-left, bottom-right
+    cxs = [0.50, 0.32, 0.68]
+    cys = [0.65, 0.35, 0.35]
+
+    FILLS = [
+        "rgba(0,209,255,0.28)",
+        "rgba(255,77,109,0.28)",
+        "rgba(80,220,100,0.28)",
+    ]
+    LINES = [
+        "rgba(0,209,255,0.90)",
+        "rgba(255,77,109,0.90)",
+        "rgba(80,220,100,0.90)",
+    ]
+
+    fig = go.Figure()
+    for idx in range(3):
+        cx, cy_, R = cxs[idx], cys[idx], Rs[idx]
+        fig.add_shape(
+            type="circle",
+            x0=cx - R, y0=cy_ - R, x1=cx + R, y1=cy_ + R,
+            fillcolor=FILLS[idx], line_color=LINES[idx], line_width=2,
+            layer="below",
+        )
+
+    # Outer labels (unique-only regions)
+    outer_labels = [
+        (cxs[0],         cys[0] + Rs[0] * 0.55, names[0], a_only),
+        (cxs[1] - Rs[1] * 0.55, cys[1],         names[1], b_only),
+        (cxs[2] + Rs[2] * 0.55, cys[2],         names[2], c_only),
+    ]
+    for lx, ly, lname, lval in outer_labels:
+        fig.add_annotation(
+            x=lx, y=ly,
+            text=f"<b>{lname[:20]}</b><br><b>{lval:,.0f}</b><br>unique",
+            showarrow=False, font=dict(size=10, color="white"), align="center",
+        )
+
+    # Pairwise overlap labels (between circles)
+    pw_labels = [
+        ((cxs[0] + cxs[1]) / 2 + 0.02, (cys[0] + cys[1]) / 2, ab_only),   # A∩B
+        ((cxs[0] + cxs[2]) / 2 - 0.02, (cys[0] + cys[2]) / 2, ac_only),   # A∩C
+        ((cxs[1] + cxs[2]) / 2,         cys[1] + 0.06,          bc_only),  # B∩C
+    ]
+    for lx, ly, lval in pw_labels:
+        fig.add_annotation(
+            x=lx, y=ly,
+            text=f"~{lval:,.0f}",
+            showarrow=False, font=dict(size=10, color="#dddddd"), align="center",
+        )
+
+    # Centre 3-way label
+    cx_mid = sum(cxs) / 3
+    cy_mid = sum(cys) / 3
+    fig.add_annotation(
+        x=cx_mid, y=cy_mid,
+        text=f"<b>~{abc:,.0f}</b><br>all three",
+        showarrow=False, font=dict(size=11, color="white"), align="center",
+    )
+
+    fig.update_layout(
+        xaxis=dict(visible=False, range=[0, 1]),
+        yaxis=dict(visible=False, range=[0.05, 0.95], scaleanchor="x"),
+        plot_bgcolor="#1a1a2e", paper_bgcolor="#1a1a2e",
+        height=480,
+        margin=dict(l=10, r=10, t=55, b=10),
+        title=dict(text="Estimated 3-Way Audience Overlap", font=dict(color="white", size=14)),
+    )
+    return fig
 
 
 if __name__ == "__main__":
