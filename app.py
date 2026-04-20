@@ -4,6 +4,7 @@ import datetime
 import math
 import os
 import pickle
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -278,11 +279,32 @@ def fetch_frequency_breakdowns(
             "level": level,
             "limit": 500,
         }
-        try:
-            return list(account.get_insights(fields=fields, params=params))
-        except Exception as exc:
-            st.warning(f"Meta API: could not fetch {label} data: {exc}")
-            return []
+        max_retries = 6
+        backoff = 20  # seconds — doubles each attempt
+        for attempt in range(max_retries):
+            try:
+                return list(account.get_insights(fields=fields, params=params))
+            except Exception as exc:
+                exc_str = str(exc)
+                # Retry on transient rate-limit errors (code 4 / subcode 1504022)
+                is_rate_limit = (
+                    '"code": 4' in exc_str
+                    or '"code":4' in exc_str
+                    or "1504022" in exc_str
+                    or "request limit" in exc_str.lower()
+                    or "too many" in exc_str.lower()
+                )
+                if is_rate_limit and attempt < max_retries - 1:
+                    wait = backoff * (2 ** attempt)
+                    st.warning(
+                        f"Meta API rate limit hit on {label} (attempt {attempt + 1}/{max_retries}). "
+                        f"Waiting {wait}s before retrying…"
+                    )
+                    time.sleep(wait)
+                    continue
+                st.warning(f"Meta API: could not fetch {label} data: {exc}")
+                return []
+        return []
 
     def _to_df(raw: list, group_cols: dict) -> pd.DataFrame:
         if not raw:
@@ -1527,6 +1549,35 @@ def main() -> None:
                     title="Cumulative Spend Split: New vs Returning People",
                 )
                 st.plotly_chart(spend_split_trend, width="stretch")
+
+        # ── Cost per New Reach ────────────────────────────────────────────────
+        if fatigue_roll["Cumulative Reach"].notna().any():
+            fatigue_roll = fatigue_roll.sort_values("Reporting starts").copy()
+            fatigue_roll["New Reach"] = (
+                fatigue_roll["Cumulative Reach"]
+                .diff()
+                .where(fatigue_roll["Cumulative Reach"].notna())
+            )
+            # First day: all reach is new
+            first_valid = fatigue_roll["Cumulative Reach"].first_valid_index()
+            if first_valid is not None:
+                fatigue_roll.loc[first_valid, "New Reach"] = fatigue_roll.loc[first_valid, "Cumulative Reach"]
+            fatigue_roll["New Reach"] = fatigue_roll["New Reach"].clip(lower=0)
+            fatigue_roll["Cost per New Reach"] = _safe_divide(
+                fatigue_roll["Amount spent (USD)"],
+                fatigue_roll["New Reach"],
+            )
+
+            cpnr_fig = px.line(
+                fatigue_roll,
+                x="Reporting starts",
+                y="Cost per New Reach",
+                markers=True,
+                title="Cost per New Reach — Daily (Spend ÷ New Unique People That Day)",
+            )
+            cpnr_fig.update_traces(line_color="#FFB347")
+            cpnr_fig.update_layout(yaxis_tickprefix="$", yaxis_tickformat=",.2f")
+            st.plotly_chart(cpnr_fig, width="stretch")
 
         if fatigue_roll["Fatigue Index"].notna().any():
             fatigue_index_fig = px.line(
